@@ -42,6 +42,12 @@ describe("clampLimit", () => {
     expect(clampLimit("")).toBe(LIMIT_DEFAULT);
     expect(clampLimit("abc")).toBe(LIMIT_DEFAULT);
     expect(clampLimit("NaN")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit(" ")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit("   ")).toBe(LIMIT_DEFAULT);
+  });
+
+  it("trims surrounding whitespace before parsing", () => {
+    expect(clampLimit(" 5 ")).toBe(5);
   });
 
   it("clamps zero and negatives up to 1", () => {
@@ -150,6 +156,32 @@ describe("GET /leaderboard (HTTP)", () => {
       const res = await fetch(`http://127.0.0.1:${port}/leaderboard`);
       const body = (await res.json()) as Body;
       expect(body.limit).toBe(LIMIT_DEFAULT);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("defaults for whitespace-only or non-numeric ?limit=", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      for (const q of ["limit=%20", "limit=abc"]) {
+        const res = await fetch(`http://127.0.0.1:${port}/leaderboard?${q}`);
+        const body = (await res.json()) as Body;
+        expect(body.limit).toBe(LIMIT_DEFAULT);
+      }
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 (not 500) for a malformed request target", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // A raw malformed path that URL() can't parse against the dummy base.
+      const res = await fetch(`http://127.0.0.1:${port}/%`);
+      const body = (await res.json()) as { error?: string };
+      expect(res.status).toBe(404);
+      expect(body.error).toBe("not_found");
     } finally {
       app.close();
     }

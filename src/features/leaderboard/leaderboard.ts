@@ -12,8 +12,11 @@ export const LIMIT_MAX = 100;
 // huge) collapses to a safe value: absent/invalid -> default; too-large -> cap;
 // too-small (<=0) -> 1. Always returns a finite int in [1, LIMIT_MAX].
 export function clampLimit(raw: string | null | undefined): number {
-  if (raw === null || raw === undefined || raw === "") return LIMIT_DEFAULT;
-  const n = Number(raw);
+  // Trim first so whitespace-only values ("%20") are treated as absent rather
+  // than coerced to 0 by Number(" ") -> 0.
+  const text = raw?.trim();
+  if (!text) return LIMIT_DEFAULT;
+  const n = Number(text);
   if (!Number.isFinite(n)) return LIMIT_DEFAULT;
   const i = Math.trunc(n);
   if (i < 1) return 1;

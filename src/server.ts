@@ -21,8 +21,15 @@ export function createApp(store: Store) {
       }
       // GET /leaderboard?limit= — top scores, ranked. Parse against a dummy
       // base so a relative req.url yields a URL we can read query params from.
-      const url = new URL(req.url ?? "/", "http://localhost");
-      if (req.method === "GET" && url.pathname === "/leaderboard") {
+      // A malformed request target throws on parse; treat that as a non-match
+      // so it falls through to 404 rather than escaping to the 500 catch.
+      let url: URL | null = null;
+      try {
+        url = new URL(req.url ?? "/", "http://localhost");
+      } catch {
+        url = null;
+      }
+      if (req.method === "GET" && url?.pathname === "/leaderboard") {
         const limit = clampLimit(url.searchParams.get("limit"));
         const body = await getLeaderboard(store, limit);
         json(res, 200, body);
