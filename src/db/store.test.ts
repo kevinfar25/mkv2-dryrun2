@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   InMemoryStore,
+  PgStore,
   normalizeLimit,
+  normalizeSeasonId,
   compareScores,
   type Score,
 } from "./store.js";
@@ -52,18 +54,18 @@ describe("InMemoryStore scores", () => {
     // the result would stay reversed. Only `id ASC` reorders it to s1,s2,s3.
     const t = new Date(0);
     const rows: Score[] = [
-      { id: "s3", playerId: "p3", points: 50, createdAt: t },
-      { id: "s2", playerId: "p2", points: 50, createdAt: t },
-      { id: "s1", playerId: "p1", points: 50, createdAt: t },
+      { id: "s3", playerId: "p3", points: 50, createdAt: t, seasonId: null },
+      { id: "s2", playerId: "p2", points: 50, createdAt: t, seasonId: null },
+      { id: "s1", playerId: "p1", points: 50, createdAt: t, seasonId: null },
     ];
     const sorted = [...rows].sort(compareScores);
     expect(sorted.map((s) => s.id)).toEqual(["s1", "s2", "s3"]);
 
     // And that id tie-break only applies AFTER points DESC and created_at ASC:
     const mixed: Score[] = [
-      { id: "s1", playerId: "p1", points: 10, createdAt: new Date(1000) },
-      { id: "s2", playerId: "p2", points: 20, createdAt: new Date(5000) },
-      { id: "s3", playerId: "p3", points: 20, createdAt: new Date(2000) },
+      { id: "s1", playerId: "p1", points: 10, createdAt: new Date(1000), seasonId: null },
+      { id: "s2", playerId: "p2", points: 20, createdAt: new Date(5000), seasonId: null },
+      { id: "s3", playerId: "p3", points: 20, createdAt: new Date(2000), seasonId: null },
     ];
     // points DESC -> the two 20s first; among them created_at ASC -> s3 (2000)
     // before s2 (5000); the lone 10 last.
@@ -199,6 +201,140 @@ describe("InMemoryStore scores", () => {
     ).rejects.toThrow(/invalid points/);
   });
 
+  it("rejects a malformed seasonId on write with one domain error (uuid parity)", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Postgres' `uuid` column rejects a non-UUID literal (22P02) before the FK
+    // is checked; InMemoryStore rejects the same shape up front so a seasonal
+    // write can't pass here yet fail against Postgres.
+    await expect(store.addScore(a, 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+    await expect(
+      store.addScore(a, 10, "11111111-1111-1111-1111"),
+    ).rejects.toThrow(/invalid seasonId/);
+  });
+
+  it("rejects an unknown (valid-format) seasonId on write, like the FK", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Well-formed but never registered -> Postgres would raise a season FK
+    // violation (23503); InMemoryStore rejects it identically.
+    await expect(
+      store.addScore(a, 10, "99999999-9999-9999-9999-999999999999"),
+    ).rejects.toThrow(/unknown season/);
+  });
+
+  it("also rejects a malformed seasonId on the read filter (uuid parity)", async () => {
+    const store = new InMemoryStore();
+    // A non-null read filter is compared against the `uuid` column, so a
+    // malformed id errors (22P02) rather than returning rows.
+    await expect(store.topScores(10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+  });
+
+  it("addScore validates seasonId format before player existence — SAME error in both stores (P4b)", async () => {
+    // Shared validation ORDER: a malformed seasonId is rejected before the
+    // player is looked up, so a bad player + bad seasonId surfaces
+    // `invalid seasonId` in BOTH stores (PgStore throws in JS before any DB
+    // call, so this needs no live connection — the pool is never queried).
+    const mem = new InMemoryStore();
+    const pg = new PgStore("postgres://mkv2:mkv2@127.0.0.1:5514/mkv2");
+    await expect(mem.addScore("bad-player", 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+    await expect(pg.addScore("bad-player", 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+  });
+
+  it("canonicalizes UUID case: an uppercase seasonId matches its lowercase season (P4c)", async () => {
+    const store = new InMemoryStore();
+    const [a, b] = await makePlayers(store, 2);
+    // Register enough seasons that the minted id carries a hex LETTER, so an
+    // uppercase spelling is a genuinely different string than the stored form.
+    let last!: Awaited<ReturnType<InMemoryStore["addSeason"]>>;
+    for (let i = 0; i < 10; i++) {
+      last = await store.addSeason(`S${i}`, new Date(0), new Date(1000));
+    }
+    const s1 = last.id; // ...00000000000a — canonical lowercase
+    const upper = s1.toUpperCase();
+    expect(s1).toMatch(/[a-f]/);
+    expect(upper).not.toBe(s1);
+
+    // A write with the uppercase spelling is stored canonically (lowercase),
+    // exactly like Postgres' `uuid` column + RETURNING season_id.
+    const written = await store.addScore(a, 10, upper);
+    expect(written.seasonId).toBe(s1);
+    // The lowercase spelling targets the SAME season.
+    await store.addScore(b, 20, s1);
+
+    // Reading by either spelling finds BOTH scores (same season).
+    const upperRead = await store.topScores(10, upper);
+    expect(upperRead.map((x) => x.points)).toEqual([20, 10]);
+    const lowerRead = await store.topScores(10, s1);
+    expect(lowerRead.map((x) => x.points)).toEqual([20, 10]);
+  });
+
+  it("filters topScores by season when a seasonId is passed", async () => {
+    const store = new InMemoryStore();
+    const [a, b, c] = await makePlayers(store, 3);
+    // Seasons must exist before a score can reference them (parity with the
+    // Postgres scores.season_id FK).
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
+    const s2 = (await store.addSeason("S2", new Date(0), new Date(1000))).id;
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 30, s2);
+    await store.addScore(c, 20, s1);
+
+    // Filtered to s1: only the two s1 scores, still fully ordered.
+    const inS1 = await store.topScores(10, s1);
+    expect(inS1.map((x) => x.points)).toEqual([20, 10]);
+    expect(inS1.map((x) => x.playerId)).toEqual([c, a]);
+    expect(inS1.every((x) => x.seasonId === s1)).toBe(true);
+
+    // Filtered to s2: only the single s2 score.
+    const inS2 = await store.topScores(10, s2);
+    expect(inS2.map((x) => x.points)).toEqual([30]);
+    expect(inS2[0].playerId).toBe(b);
+  });
+
+  it("default path (no seasonId) keeps current behavior across seasons", async () => {
+    const store = new InMemoryStore();
+    const [a, b, c] = await makePlayers(store, 3);
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 30); // no season
+    await store.addScore(c, 20, s1);
+
+    // Omitting seasonId returns ALL scores regardless of season, ordered as before.
+    const all = await store.topScores(10);
+    expect(all.map((x) => x.points)).toEqual([30, 20, 10]);
+    expect(all.map((x) => x.playerId)).toEqual([b, c, a]);
+    // The default path never surfaces season_id (parity with PgStore, which
+    // can't project it without breaking expand/contract).
+    expect(all.every((x) => x.seasonId === null)).toBe(true);
+  });
+
+  it("returns an empty array for a seasonId with no matching scores", async () => {
+    const store = new InMemoryStore();
+    const [a, b] = await makePlayers(store, 2);
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 20, s1);
+
+    // Reading by a valid-but-unused season yields no rows (the read path does
+    // NOT enforce season existence — only the write FK does, mirroring Postgres
+    // `WHERE season_id = $2` returning zero rows rather than erroring).
+    const none = await store.topScores(10, "99999999-9999-9999-9999-999999999999");
+    expect(none).toEqual([]);
+
+    // Passing null is treated as NO filter (expand/contract safe): identical to
+    // omitting seasonId, it returns ALL scores.
+    expect(await store.topScores(10, null)).toEqual(await store.topScores(10));
+  });
+
   it("does not mutate internal state when sorting", async () => {
     const store = new InMemoryStore();
     const [a, b] = await makePlayers(store, 2);
@@ -237,5 +373,53 @@ describe("InMemoryStore scores", () => {
     // And two queries never hand back the same Date instance.
     const again = await store.topScores(10);
     expect(again[0].createdAt).not.toBe(rescored[0].createdAt);
+  });
+
+  it("topScores returns the CANONICAL (lowercase) seasonId, matching addScore (FIX A)", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Mint enough seasons that the id carries a hex letter, so its uppercase
+    // spelling is a genuinely different string.
+    let last!: Awaited<ReturnType<InMemoryStore["addSeason"]>>;
+    for (let i = 0; i < 10; i++) {
+      last = await store.addSeason(`S${i}`, new Date(0), new Date(1000));
+    }
+    const lower = last.id;
+    const upper = lower.toUpperCase();
+    expect(lower).toMatch(/[a-f]/);
+    expect(upper).not.toBe(lower);
+
+    const written = await store.addScore(a, 10, upper);
+    // Read back with the SAME uppercase argument the caller used.
+    const read = await store.topScores(10, upper);
+    expect(read).toHaveLength(1);
+    // Returned seasonId is the canonical lowercase, NOT the raw uppercase arg,
+    // and equals both normalizeSeasonId(X) and what addScore returned.
+    expect(read[0].seasonId).toBe(normalizeSeasonId(upper));
+    expect(read[0].seasonId).toBe(written.seasonId);
+    expect(read[0].seasonId).toBe(lower);
+  });
+
+  it("addSeason validates its date inputs (FIX C)", async () => {
+    const store = new InMemoryStore();
+    // Invalid Date (getTime() NaN) — InMemory would previously store it while
+    // Postgres rejects on serialization; now both throw the same domain error.
+    await expect(
+      store.addSeason("bad", new Date("nope"), new Date(1000)),
+    ).rejects.toThrow(/invalid season dates/);
+    await expect(
+      store.addSeason("bad", new Date(0), new Date("nope")),
+    ).rejects.toThrow(/invalid season dates/);
+    // Inverted / empty range (endsAt <= startsAt) is rejected too.
+    await expect(
+      store.addSeason("inverted", new Date(1000), new Date(500)),
+    ).rejects.toThrow(/invalid season dates/);
+    await expect(
+      store.addSeason("empty", new Date(1000), new Date(1000)),
+    ).rejects.toThrow(/invalid season dates/);
+    // A valid season still succeeds unchanged.
+    const ok = await store.addSeason("good", new Date(0), new Date(1000));
+    expect(ok.startsAt.getTime()).toBe(0);
+    expect(ok.endsAt.getTime()).toBe(1000);
   });
 });
