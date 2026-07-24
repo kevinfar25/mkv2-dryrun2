@@ -330,9 +330,9 @@ describe("InMemoryStore scores", () => {
     const none = await store.topScores(10, "99999999-9999-9999-9999-999999999999");
     expect(none).toEqual([]);
 
-    // Passing null filters to the not-yet-attached (season-less) scores, of which
-    // there are none here.
-    expect(await store.topScores(10, null)).toEqual([]);
+    // Passing null is treated as NO filter (expand/contract safe): identical to
+    // omitting seasonId, it returns ALL scores.
+    expect(await store.topScores(10, null)).toEqual(await store.topScores(10));
   });
 
   it("does not mutate internal state when sorting", async () => {

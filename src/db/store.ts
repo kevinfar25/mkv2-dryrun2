@@ -33,10 +33,10 @@ export interface Store {
   // Postgres would reject, breaking store parity.
   addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season>;
   addScore(playerId: string, points: number, seasonId?: string | null): Promise<Score>;
-  // topScores filters by season ONLY when seasonId is passed. Omitting it (the
-  // default path) must not touch the season_id column at all, so pre-migration
-  // schema + old code stay correct (expand/contract — migrations deploy
-  // separately from code).
+  // topScores filters by season ONLY when a non-null seasonId is passed.
+  // Omitting it OR passing null (the no-filter path) must not touch the
+  // season_id column at all, so pre-migration schema + old code stay correct
+  // (expand/contract — migrations deploy separately from code).
   topScores(limit?: number | null, seasonId?: string | null): Promise<Score[]>;
   health(): Promise<boolean>;
 }
@@ -256,11 +256,12 @@ export class InMemoryStore implements Store {
     // stored (lowercase) season_id, exactly as Postgres' `uuid` column would.
     const normalizedFilter =
       seasonId == null ? null : normalizeSeasonId(seasonId);
-    // Season filter is opt-in: only when a seasonId is explicitly passed do we
-    // touch season_id at all. The default path is byte-for-byte the old
-    // behavior (mirrors PgStore, whose default query never names season_id).
+    // Season filter is opt-in: null is treated as NO filter (expand/contract
+    // safe); only a non-null seasonId references season_id. The no-filter path
+    // is byte-for-byte the old behavior (mirrors PgStore, whose default query
+    // never names season_id).
     const source =
-      seasonId === undefined
+      seasonId == null
         ? this.scores
         : this.scores.filter((s) => s.seasonId === normalizedFilter);
     const sorted = [...source].sort(compareScores);
@@ -379,10 +380,11 @@ export class PgStore implements Store {
     seasonId?: string | null,
   ): Promise<Score[]> {
     // Expand/contract (critical): the DEFAULT query never references season_id,
-    // so it runs unchanged against the pre-migration schema. A WHERE season_id
-    // clause is added ONLY when a caller explicitly passes a seasonId; the
-    // selected columns stay identical either way.
-    const filtered = seasonId !== undefined;
+    // so it runs unchanged against the pre-migration schema. null is treated as
+    // NO filter (expand/contract safe); a WHERE season_id clause is added ONLY
+    // when a non-null seasonId is passed — only then do we reference season_id.
+    // The selected columns stay identical either way.
+    const filtered = seasonId != null;
     // Parity with InMemoryStore: a non-null read filter is validated up front so
     // a malformed id fails identically instead of as a raw Postgres 22P02.
     if (seasonId != null) {
