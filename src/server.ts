@@ -81,7 +81,7 @@ export function createApp(store: Store) {
       // POST /scores — validate a { playerId, points } body and persist. Invalid
       // JSON or a body that fails the schema returns 400 (never 500); an unknown
       // player (rejected by the store's FK contract) is also a client error.
-      if (req.method === "POST" && url?.pathname === "/scores") {
+      if (req.method === "POST" && rawPath === "/scores") {
         let parsed: unknown;
         try {
           parsed = JSON.parse(await readBody(req));
