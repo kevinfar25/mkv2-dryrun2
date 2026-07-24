@@ -38,6 +38,11 @@ export interface Store {
   // season_id column at all, so pre-migration schema + old code stay correct
   // (expand/contract — migrations deploy separately from code).
   topScores(limit?: number | null, seasonId?: string | null): Promise<Score[]>;
+  // A player's points, most-recent-first (created_at DESC, id DESC tie-break).
+  // Pure read: references no season/other columns (expand/contract safe). An
+  // unknown player yields `[]` in BOTH stores (identical behavior) — the HTTP
+  // layer uses getPlayer to distinguish unknown from a player with no scores.
+  scoresForPlayer(playerId: string): Promise<number[]>;
   health(): Promise<boolean>;
 }
 
@@ -274,6 +279,22 @@ export class InMemoryStore implements Store {
     return rows.map((s) => ({ ...clone(s), seasonId: outSeason }));
   }
 
+  // A player's points, most-recent-first: created_at DESC, then id DESC as the
+  // deterministic tie-break (identical string/text ordering to PgStore). All
+  // in-memory scores share CLOCK_MS, so the id DESC tie-break carries the
+  // ordering — exactly the parity edge topScores exercises, mirrored here.
+  // Unknown player -> [] (a player with no scores also yields []).
+  async scoresForPlayer(playerId: string): Promise<number[]> {
+    return this.scores
+      .filter((s) => s.playerId === playerId)
+      .sort(
+        (a, b) =>
+          b.createdAt.getTime() - a.createdAt.getTime() ||
+          (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+      )
+      .map((s) => s.points);
+  }
+
   async health(): Promise<boolean> {
     return true;
   }
@@ -295,11 +316,23 @@ export class PgStore implements Store {
   }
 
   async getPlayer(id: string): Promise<Player | null> {
-    const { rows } = await this.pool.query<Player>(
-      "SELECT id, name FROM players WHERE id = $1",
-      [id],
-    );
-    return rows[0] ?? null;
+    try {
+      const { rows } = await this.pool.query<Player>(
+        "SELECT id, name FROM players WHERE id = $1",
+        [id],
+      );
+      return rows[0] ?? null;
+    } catch (err) {
+      // A malformed id (22P02 invalid_text_representation, e.g. a non-uuid
+      // string against the uuid `players.id` column) names no player -> null,
+      // matching InMemoryStore's `get(id) ?? null`. Without this the two stores
+      // diverge: InMemory returns null while Pg throws, which would surface as a
+      // 500 instead of a clean unknown-player result. Mirrors the 22P02 handling
+      // in addScore / scoresForPlayer.
+      const code = (err as { code?: string })?.code;
+      if (code === "22P02") return null;
+      throw err;
+    }
   }
 
   async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
@@ -418,6 +451,26 @@ export class PgStore implements Store {
       // for the same id, even when the caller passed uppercase.
       seasonId: seasonId == null ? null : normalizeSeasonId(seasonId),
     }));
+  }
+
+  // A player's points, most-recent-first. Deterministic, identical to
+  // InMemoryStore: created_at DESC, then id DESC. Pure read of scores.points;
+  // references no other/new columns (expand/contract safe). An unknown player
+  // simply matches no rows and returns [] — same as a player with no scores.
+  async scoresForPlayer(playerId: string): Promise<number[]> {
+    try {
+      const { rows } = await this.pool.query<{ points: number }>(
+        "SELECT points FROM scores WHERE player_id = $1 ORDER BY created_at DESC, id DESC",
+        [playerId],
+      );
+      return rows.map((r) => r.points);
+    } catch (err) {
+      // A malformed player id (22P02 invalid_text_representation) is treated as
+      // an unknown player -> no rows, matching InMemoryStore's [] behavior.
+      const code = (err as { code?: string })?.code;
+      if (code === "22P02") return [];
+      throw err;
+    }
   }
 
   async health(): Promise<boolean> {
