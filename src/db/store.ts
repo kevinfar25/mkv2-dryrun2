@@ -1,6 +1,12 @@
 import pg from "pg";
 
 export type Player = { id: string; name: string };
+export type Score = {
+  id: string;
+  playerId: string;
+  points: number;
+  createdAt: Date;
+};
 
 /**
  * The persistence seam. Unit tests + CI run against InMemoryStore (hermetic, no DB).
@@ -10,12 +16,16 @@ export type Player = { id: string; name: string };
 export interface Store {
   addPlayer(name: string): Promise<Player>;
   getPlayer(id: string): Promise<Player | null>;
+  addScore(playerId: string, points: number): Promise<Score>;
+  topScores(limit: number): Promise<Score[]>;
   health(): Promise<boolean>;
 }
 
 export class InMemoryStore implements Store {
   private players = new Map<string, Player>();
+  private scores: Score[] = [];
   private seq = 0;
+  private scoreSeq = 0;
 
   async addPlayer(name: string): Promise<Player> {
     const id = `p${++this.seq}`;
@@ -26,6 +36,31 @@ export class InMemoryStore implements Store {
 
   async getPlayer(id: string): Promise<Player | null> {
     return this.players.get(id) ?? null;
+  }
+
+  async addScore(playerId: string, points: number): Promise<Score> {
+    const n = ++this.scoreSeq;
+    // Monotonic created_at per insertion so ordering is deterministic and
+    // mirrors Postgres, where each INSERT's now() advances.
+    const score: Score = {
+      id: `s${n}`,
+      playerId,
+      points,
+      createdAt: new Date(n),
+    };
+    this.scores.push(score);
+    return score;
+  }
+
+  async topScores(limit: number): Promise<Score[]> {
+    return [...this.scores]
+      .sort(
+        (a, b) =>
+          b.points - a.points ||
+          a.createdAt.getTime() - b.createdAt.getTime() ||
+          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      )
+      .slice(0, Math.max(0, limit));
   }
 
   async health(): Promise<boolean> {
@@ -54,6 +89,40 @@ export class PgStore implements Store {
       [id],
     );
     return rows[0] ?? null;
+  }
+
+  async addScore(playerId: string, points: number): Promise<Score> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      player_id: string;
+      points: number;
+      created_at: Date;
+    }>(
+      "INSERT INTO scores(player_id, points) VALUES($1, $2) RETURNING id, player_id, points, created_at",
+      [playerId, points],
+    );
+    const r = rows[0];
+    return { id: r.id, playerId: r.player_id, points: r.points, createdAt: r.created_at };
+  }
+
+  async topScores(limit: number): Promise<Score[]> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      player_id: string;
+      points: number;
+      created_at: Date;
+    }>(
+      // Deterministic, identical to InMemoryStore: points desc, then created_at
+      // asc (earliest first), then id as a final stable tie-break.
+      "SELECT id, player_id, points, created_at FROM scores ORDER BY points DESC, created_at ASC, id ASC LIMIT $1",
+      [Math.max(0, limit)],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      playerId: r.player_id,
+      points: r.points,
+      createdAt: r.created_at,
+    }));
   }
 
   async health(): Promise<boolean> {
