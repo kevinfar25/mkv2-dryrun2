@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   InMemoryStore,
+  PgStore,
   normalizeLimit,
   compareScores,
   type Score,
@@ -230,6 +231,49 @@ describe("InMemoryStore scores", () => {
     await expect(store.topScores(10, "not-a-uuid")).rejects.toThrow(
       /invalid seasonId/,
     );
+  });
+
+  it("addScore validates seasonId format before player existence — SAME error in both stores (P4b)", async () => {
+    // Shared validation ORDER: a malformed seasonId is rejected before the
+    // player is looked up, so a bad player + bad seasonId surfaces
+    // `invalid seasonId` in BOTH stores (PgStore throws in JS before any DB
+    // call, so this needs no live connection — the pool is never queried).
+    const mem = new InMemoryStore();
+    const pg = new PgStore("postgres://mkv2:mkv2@127.0.0.1:5514/mkv2");
+    await expect(mem.addScore("bad-player", 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+    await expect(pg.addScore("bad-player", 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+  });
+
+  it("canonicalizes UUID case: an uppercase seasonId matches its lowercase season (P4c)", async () => {
+    const store = new InMemoryStore();
+    const [a, b] = await makePlayers(store, 2);
+    // Register enough seasons that the minted id carries a hex LETTER, so an
+    // uppercase spelling is a genuinely different string than the stored form.
+    let last!: Awaited<ReturnType<InMemoryStore["addSeason"]>>;
+    for (let i = 0; i < 10; i++) {
+      last = await store.addSeason(`S${i}`, new Date(0), new Date(1000));
+    }
+    const s1 = last.id; // ...00000000000a — canonical lowercase
+    const upper = s1.toUpperCase();
+    expect(s1).toMatch(/[a-f]/);
+    expect(upper).not.toBe(s1);
+
+    // A write with the uppercase spelling is stored canonically (lowercase),
+    // exactly like Postgres' `uuid` column + RETURNING season_id.
+    const written = await store.addScore(a, 10, upper);
+    expect(written.seasonId).toBe(s1);
+    // The lowercase spelling targets the SAME season.
+    await store.addScore(b, 20, s1);
+
+    // Reading by either spelling finds BOTH scores (same season).
+    const upperRead = await store.topScores(10, upper);
+    expect(upperRead.map((x) => x.points)).toEqual([20, 10]);
+    const lowerRead = await store.topScores(10, s1);
+    expect(lowerRead.map((x) => x.points)).toEqual([20, 10]);
   });
 
   it("filters topScores by season when a seasonId is passed", async () => {

@@ -77,6 +77,15 @@ export function assertValidSeasonId(seasonId: string): void {
   }
 }
 
+// Postgres `uuid` stores/compares in canonical LOWERCASE, so `A1B2...` and
+// `a1b2...` are the SAME value there. InMemoryStore keeps season_id as a raw
+// string, so without folding case an uppercase-spelled seasonId would miss a
+// season Postgres would match. Fold to lowercase before storing/comparing so
+// both stores agree. Assumes a UUID-shaped input (validate first).
+export function normalizeSeasonId(seasonId: string): string {
+  return seasonId.toLowerCase();
+}
+
 // limit contract: a finite value is clamped to a non-negative integer and
 // preserved AS-IS (floats truncated via Math.trunc, negatives -> 0); any
 // non-finite value (undefined/null/NaN/Infinity) means "no limit" — return ALL
@@ -171,18 +180,28 @@ export class InMemoryStore implements Store {
     seasonId: string | null = null,
   ): Promise<Score> {
     assertValidPoints(points);
+    // ONE shared validation ORDER across both stores: validate input FORMAT
+    // first (points, then seasonId shape), THEN existence (player, then season).
+    // PgStore validates the seasonId shape in JS before the DB ever checks the
+    // player FK, so a bad player + malformed seasonId must surface the SAME
+    // `invalid seasonId` error here — hence the shape check precedes the player
+    // existence check. The default path (seasonId null) needs no season.
+    if (seasonId != null) {
+      assertValidSeasonId(seasonId);
+    }
     // Enforce the same FK contract PgStore gets for free from
     // scores.player_id -> players.id: unknown players are rejected.
     if (!this.players.has(playerId)) {
       throw new Error(`unknown player: ${playerId}`);
     }
-    // Season parity: only when a season is attached. Match Postgres' `uuid`
-    // column (reject malformed ids) AND its scores.season_id FK (reject unknown
-    // seasons) so a seasonal write behaves identically in both stores. The
-    // default path (seasonId null) requires no season, exactly like PgStore.
+    // Season existence parity (scores.season_id FK). Canonicalize case first so
+    // an uppercase-spelled id matches its registered (lowercase) season, exactly
+    // as Postgres' `uuid` column would. The unknown-season error still reports
+    // the caller's original spelling, matching PgStore's message.
+    let normalizedSeason: string | null = null;
     if (seasonId != null) {
-      assertValidSeasonId(seasonId);
-      if (!this.seasons.has(seasonId)) {
+      normalizedSeason = normalizeSeasonId(seasonId);
+      if (!this.seasons.has(normalizedSeason)) {
         throw new Error(`unknown season: ${seasonId}`);
       }
     }
@@ -192,7 +211,10 @@ export class InMemoryStore implements Store {
       playerId,
       points,
       createdAt: new Date(InMemoryStore.CLOCK_MS),
-      seasonId,
+      // Store the canonical (lowercase) form, mirroring Postgres' `uuid` column
+      // and its RETURNING season_id (so addScore hands back the same value Pg
+      // would even when the caller passed uppercase).
+      seasonId: normalizedSeason,
     };
     // Store an immutable snapshot; return an independent clone so a caller
     // mutating either the returned object or its Date can't corrupt store state.
@@ -211,13 +233,17 @@ export class InMemoryStore implements Store {
     if (seasonId != null) {
       assertValidSeasonId(seasonId);
     }
+    // Canonicalize the filter's case so an uppercase-spelled id matches the
+    // stored (lowercase) season_id, exactly as Postgres' `uuid` column would.
+    const normalizedFilter =
+      seasonId == null ? null : normalizeSeasonId(seasonId);
     // Season filter is opt-in: only when a seasonId is explicitly passed do we
     // touch season_id at all. The default path is byte-for-byte the old
     // behavior (mirrors PgStore, whose default query never names season_id).
     const source =
       seasonId === undefined
         ? this.scores
-        : this.scores.filter((s) => s.seasonId === seasonId);
+        : this.scores.filter((s) => s.seasonId === normalizedFilter);
     const sorted = [...source].sort(compareScores);
     const rows = n === null ? sorted : sorted.slice(0, n);
     // Match PgStore's projection exactly: the default path never surfaces
