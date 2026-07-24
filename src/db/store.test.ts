@@ -423,3 +423,34 @@ describe("InMemoryStore scores", () => {
     expect(ok.endsAt.getTime()).toBe(1000);
   });
 });
+
+describe("InMemoryStore.scoresForPlayer ordering", () => {
+  it("returns a player's points most-recent-first past 10 scores (insertion sequence, NOT lexicographic id)", async () => {
+    const store = new InMemoryStore();
+    const [p] = await makePlayers(store, 1);
+
+    // Insert 12+ scores whose points equal their insertion order so the
+    // expected most-recent-first sequence is unambiguous. All share CLOCK_MS,
+    // so the ordering falls entirely to the insertion-sequence tie-break —
+    // exactly where lexicographic id ordering ("s10" < "s2") would corrupt it.
+    const n = 15;
+    for (let i = 1; i <= n; i++) {
+      await store.addScore(p, i);
+    }
+
+    const points = await store.scoresForPlayer(p);
+    // Most-recent-first: 15, 14, ..., 1.
+    const expected = Array.from({ length: n }, (_, i) => n - i);
+    expect(points).toEqual(expected);
+    // Guard against the lexicographic-id regression specifically: the newest
+    // score (points 15, id "s15") must lead, not "s9".
+    expect(points[0]).toBe(15);
+  });
+
+  it("returns [] for an unknown player and for a player with no scores", async () => {
+    const store = new InMemoryStore();
+    const [p] = await makePlayers(store, 1);
+    expect(await store.scoresForPlayer("nope")).toEqual([]);
+    expect(await store.scoresForPlayer(p)).toEqual([]);
+  });
+});

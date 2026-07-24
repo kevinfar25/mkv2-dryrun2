@@ -38,6 +38,11 @@ export interface Store {
   // season_id column at all, so pre-migration schema + old code stay correct
   // (expand/contract — migrations deploy separately from code).
   topScores(limit?: number | null, seasonId?: string | null): Promise<Score[]>;
+  // A player's points, most-recent-first (created_at DESC, id DESC tie-break).
+  // Pure read: references no season/other columns (expand/contract safe). An
+  // unknown player yields `[]` in BOTH stores (identical behavior) — the HTTP
+  // layer uses getPlayer to distinguish unknown from a player with no scores.
+  scoresForPlayer(playerId: string): Promise<number[]>;
   health(): Promise<boolean>;
 }
 
@@ -157,6 +162,13 @@ export class InMemoryStore implements Store {
   private seq = 0;
   private seasonSeq = 0;
   private scoreSeq = 0;
+  // Monotonic INSERTION SEQUENCE per score id. `scoreSeq` (and thus the numeric
+  // suffix of the `s<n>` id) already increases per addScore, but the id is a
+  // STRING: lexicographic ordering breaks past 9 scores ("s10" < "s2"), which is
+  // exactly what corrupts a most-recent-first ordering keyed off id text. This
+  // map preserves the true numeric insertion order so scoresForPlayer can order
+  // by it directly instead of by the string id.
+  private insertionSeq = new Map<string, number>();
 
   // All in-memory scores share one created_at VALUE. Postgres `now()` is the
   // transaction timestamp, so scores inserted in the same instant/transaction
@@ -235,6 +247,8 @@ export class InMemoryStore implements Store {
       // would even when the caller passed uppercase).
       seasonId: normalizedSeason,
     };
+    // Record the numeric insertion order for this id (see insertionSeq).
+    this.insertionSeq.set(score.id, n);
     // Store an immutable snapshot; return an independent clone so a caller
     // mutating either the returned object or its Date can't corrupt store state.
     this.scores.push(clone(score));
@@ -274,6 +288,30 @@ export class InMemoryStore implements Store {
     return rows.map((s) => ({ ...clone(s), seasonId: outSeason }));
   }
 
+  // A player's points, most-recent-first: created_at DESC, then INSERTION
+  // SEQUENCE DESC (see insertionSeq). All in-memory scores share CLOCK_MS, so
+  // the sequence tie-break carries the ordering; using the numeric insertion
+  // sequence (not the string id) makes this genuinely most-recent-first even
+  // past 10 scores, where lexicographic id ordering ("s10" < "s2") would fail.
+  //
+  // Cross-store note: PgStore tie-breaks identical created_at by `id DESC`
+  // (uuid text), a different domain from this insertion sequence, so on rows
+  // that collide on created_at the two stores' relative order is inherently
+  // arbitrary (a documented limitation). What must hold in BOTH stores is that
+  // WITHIN a store the ordering is correct most-recent-first / deterministic.
+  //
+  // Unknown player -> [] (a player with no scores also yields []).
+  async scoresForPlayer(playerId: string): Promise<number[]> {
+    return this.scores
+      .filter((s) => s.playerId === playerId)
+      .sort(
+        (a, b) =>
+          b.createdAt.getTime() - a.createdAt.getTime() ||
+          (this.insertionSeq.get(b.id) ?? 0) - (this.insertionSeq.get(a.id) ?? 0),
+      )
+      .map((s) => s.points);
+  }
+
   async health(): Promise<boolean> {
     return true;
   }
@@ -295,11 +333,23 @@ export class PgStore implements Store {
   }
 
   async getPlayer(id: string): Promise<Player | null> {
-    const { rows } = await this.pool.query<Player>(
-      "SELECT id, name FROM players WHERE id = $1",
-      [id],
-    );
-    return rows[0] ?? null;
+    try {
+      const { rows } = await this.pool.query<Player>(
+        "SELECT id, name FROM players WHERE id = $1",
+        [id],
+      );
+      return rows[0] ?? null;
+    } catch (err) {
+      // A malformed id (22P02 invalid_text_representation, e.g. a non-uuid
+      // string against the uuid `players.id` column) names no player -> null,
+      // matching InMemoryStore's `get(id) ?? null`. Without this the two stores
+      // diverge: InMemory returns null while Pg throws, which would surface as a
+      // 500 instead of a clean unknown-player result. Mirrors the 22P02 handling
+      // in addScore / scoresForPlayer.
+      const code = (err as { code?: string })?.code;
+      if (code === "22P02") return null;
+      throw err;
+    }
   }
 
   async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
@@ -418,6 +468,29 @@ export class PgStore implements Store {
       // for the same id, even when the caller passed uppercase.
       seasonId: seasonId == null ? null : normalizeSeasonId(seasonId),
     }));
+  }
+
+  // A player's points, most-recent-first: created_at DESC, then id DESC (uuid
+  // text) as a deterministic tie-break. On rows with identical created_at the
+  // cross-store order vs InMemoryStore (which tie-breaks on insertion sequence)
+  // is inherently arbitrary — a documented limitation; WITHIN this store the
+  // ordering is deterministic and most-recent-first. Pure read of scores.points;
+  // references no other/new columns (expand/contract safe). An unknown player
+  // simply matches no rows and returns [] — same as a player with no scores.
+  async scoresForPlayer(playerId: string): Promise<number[]> {
+    try {
+      const { rows } = await this.pool.query<{ points: number }>(
+        "SELECT points FROM scores WHERE player_id = $1 ORDER BY created_at DESC, id DESC",
+        [playerId],
+      );
+      return rows.map((r) => r.points);
+    } catch (err) {
+      // A malformed player id (22P02 invalid_text_representation) is treated as
+      // an unknown player -> no rows, matching InMemoryStore's [] behavior.
+      const code = (err as { code?: string })?.code;
+      if (code === "22P02") return [];
+      throw err;
+    }
   }
 
   async health(): Promise<boolean> {

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { Store } from "./db/store.js";
 import { clampLimit, getLeaderboard } from "./features/leaderboard/leaderboard.js";
 import { scoreInputSchema } from "./features/scores/scores.js";
+import { getPlayerStats } from "./features/stats/stats.js";
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
@@ -116,6 +117,32 @@ export function createApp(store: Store) {
           throw err;
         }
         return;
+      }
+      // GET /players/:id/stats — aggregate stats (best/count/average) for one
+      // player. Unknown player -> 404 not_found (detected via getPlayer, so a
+      // known player with no scores is a 200 with null best/average, distinct
+      // from a genuinely unknown id). The id segment is URL-decoded.
+      if (req.method === "GET") {
+        const m = /^\/players\/([^/]+)\/stats$/.exec(rawPath);
+        if (m) {
+          // A malformed percent-encoding in the id segment can't name a real
+          // player -> 404 rather than escaping to the 500 catch.
+          let playerId: string;
+          try {
+            playerId = decodeURIComponent(m[1]);
+          } catch {
+            json(res, 404, { error: "not_found" });
+            return;
+          }
+          const player = await store.getPlayer(playerId);
+          if (!player) {
+            json(res, 404, { error: "not_found" });
+            return;
+          }
+          const { best, count, average } = await getPlayerStats(store, playerId);
+          json(res, 200, { best, count, average });
+          return;
+        }
       }
       json(res, 404, { error: "not_found" });
     } catch {
