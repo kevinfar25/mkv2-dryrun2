@@ -64,6 +64,37 @@ describe("computeStats (unit)", () => {
   it("returns nulls for the empty case", () => {
     expect(computeStats([])).toEqual({ best: null, count: 0, average: null });
   });
+
+  it("computes best over a very large array without a stack overflow", () => {
+    // `Math.max(...points)` throws RangeError (Maximum call stack size exceeded)
+    // for arrays this large; a plain loop must not.
+    const n = 500_000;
+    const points = new Array<number>(n);
+    for (let i = 0; i < n; i++) points[i] = i;
+    let stats!: ReturnType<typeof computeStats>;
+    expect(() => {
+      stats = computeStats(points);
+    }).not.toThrow();
+    expect(stats.best).toBe(n - 1);
+    expect(stats.count).toBe(n);
+  });
+
+  it("keeps the average exact when sum*100 exceeds Number.MAX_SAFE_INTEGER", () => {
+    // 100k scores of 2_000_000_000 (near int32 max). sum = 2e14, sum*100 = 2e16,
+    // which is > Number.MAX_SAFE_INTEGER (~9.007e15) — float arithmetic drifts,
+    // BigInt does not. The exact mean is 2_000_000_000.
+    const n = 100_000;
+    const v = 2_000_000_000;
+    const points = new Array<number>(n).fill(v);
+    expect(computeStats(points).average).toBe(v);
+
+    // Same scale but with a fractional mean that must round half-away-from-zero:
+    // add one extra unit so sum = n*v + 1, mean = v + 1/n = 2_000_000_000.00001
+    // -> rounds to 2_000_000_000 (2dp). Perturb by 5 units so the 2dp digit moves.
+    const points2 = new Array<number>(n).fill(v);
+    points2[0] = v + n / 200; // adds 0.005 to the mean -> +0.01 after rounding
+    expect(computeStats(points2).average).toBe(v + 0.01);
+  });
 });
 
 describe("GET /players/:id/stats (HTTP, against InMemoryStore)", () => {
