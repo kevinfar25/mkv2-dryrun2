@@ -42,33 +42,40 @@ export function assertValidPoints(points: number): void {
   }
 }
 
-// limit contract: a finite value is clamped to a non-negative integer; any
+// limit contract: a finite value is clamped to a non-negative integer and
+// preserved AS-IS (floats truncated via Math.trunc, negatives -> 0); any
 // non-finite value (undefined/null/NaN/Infinity) means "no limit" — return ALL
 // rows, represented as `null` (Postgres reads `LIMIT NULL` as unbounded and
 // InMemoryStore skips the slice).
 //
-// Oversized FINITE limits are also mapped to `null` (unbounded): an in-memory
-// `slice(0, 1e100)` silently returns everything, but Postgres `LIMIT 1e100`
-// overflows bigint and errors — divergent behaviour. Any request for more than
-// MAX_LIMIT rows means "give me everything" in both stores, so both collapse to
-// the same unbounded query and stay identical.
-export const MAX_LIMIT = 1_000_000;
+// A large finite limit is a genuine bound, NOT a request for everything:
+// `topScores(2_000_000)` must cap at 2,000,000 rows in both stores. Only
+// non-finite input collapses to unbounded. `Number.isFinite` already rejects
+// NaN/Infinity, and any finite number is a safe integer after Math.trunc within
+// the JS safe-integer range that Math.trunc yields here, so no arbitrary cap is
+// imposed.
 export function normalizeLimit(limit?: number | null): number | null {
   if (limit == null || !Number.isFinite(limit)) return null;
-  const n = Math.max(0, Math.trunc(limit));
-  return n > MAX_LIMIT ? null : n;
+  return Math.max(0, Math.trunc(limit));
 }
 
 // Deterministic ordering contract, IDENTICAL in both stores:
 //   points DESC, created_at ASC, id ASC
 // The final `id` tie-break is what makes equal-points/equal-created_at rows
 // deterministic; it must not rely on fabricated strictly-increasing timestamps.
-function compareScores(a: Score, b: Score): number {
+export function compareScores(a: Score, b: Score): number {
   return (
     b.points - a.points ||
     a.createdAt.getTime() - b.createdAt.getTime() ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
   );
+}
+
+// Deep-copy a Score (including its Date) so InMemoryStore never shares mutable
+// state with callers — matching PgStore, which materializes fresh objects per
+// query.
+function clone(s: Score): Score {
+  return { ...s, createdAt: new Date(s.createdAt.getTime()) };
 }
 
 export class InMemoryStore implements Store {
@@ -77,13 +84,16 @@ export class InMemoryStore implements Store {
   private seq = 0;
   private scoreSeq = 0;
 
-  // All in-memory scores share one created_at. Postgres `now()` is the
+  // All in-memory scores share one created_at VALUE. Postgres `now()` is the
   // transaction timestamp, so scores inserted in the same instant/transaction
   // collide on created_at and fall through to the `id` tie-break — exactly the
   // parity edge a fabricated strictly-increasing clock would hide. A constant
-  // clock makes that the common case, so the id tie-break is genuinely
+  // clock value makes that the common case, so the id tie-break is genuinely
   // exercised and insertion order is preserved via the `s1 < s2 < ...` ids.
-  private static readonly CLOCK = new Date(0);
+  // NB: this is a numeric epoch, not a shared Date instance — each row gets its
+  // own fresh Date so a caller mutating a returned `createdAt` can't leak into
+  // stored state (PgStore hands back fresh Dates per query too).
+  private static readonly CLOCK_MS = 0;
 
   async addPlayer(name: string): Promise<Player> {
     const id = `p${++this.seq}`;
@@ -108,16 +118,19 @@ export class InMemoryStore implements Store {
       id: `s${n}`,
       playerId,
       points,
-      createdAt: InMemoryStore.CLOCK,
+      createdAt: new Date(InMemoryStore.CLOCK_MS),
     };
-    this.scores.push(score);
-    return score;
+    // Store an immutable snapshot; return an independent clone so a caller
+    // mutating either the returned object or its Date can't corrupt store state.
+    this.scores.push(clone(score));
+    return clone(score);
   }
 
   async topScores(limit?: number | null): Promise<Score[]> {
     const n = normalizeLimit(limit);
     const sorted = [...this.scores].sort(compareScores);
-    return n === null ? sorted : sorted.slice(0, n);
+    const rows = n === null ? sorted : sorted.slice(0, n);
+    return rows.map(clone);
   }
 
   async health(): Promise<boolean> {

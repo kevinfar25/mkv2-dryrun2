@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { InMemoryStore } from "./store.js";
+import {
+  InMemoryStore,
+  normalizeLimit,
+  compareScores,
+  type Score,
+} from "./store.js";
 
 // Helper: create N players and return their ids, so scores reference real
 // players (mirrors the PgStore FK contract).
@@ -38,6 +43,35 @@ describe("InMemoryStore scores", () => {
     expect(top[0].createdAt.getTime()).toBe(top[1].createdAt.getTime());
     expect(top[1].createdAt.getTime()).toBe(top[2].createdAt.getTime());
     expect(top.map((s) => s.id)).toEqual([first.id, second.id, third.id]);
+  });
+
+  it("uses id ASC as the tie-break decider (proven against reversed input)", () => {
+    // Force the comparator to be the decider: feed rows whose ARRAY order is the
+    // reverse of their id order, all with identical points AND created_at. A
+    // stable sort preserves input order, so if the `id` tie-break were removed
+    // the result would stay reversed. Only `id ASC` reorders it to s1,s2,s3.
+    const t = new Date(0);
+    const rows: Score[] = [
+      { id: "s3", playerId: "p3", points: 50, createdAt: t },
+      { id: "s2", playerId: "p2", points: 50, createdAt: t },
+      { id: "s1", playerId: "p1", points: 50, createdAt: t },
+    ];
+    const sorted = [...rows].sort(compareScores);
+    expect(sorted.map((s) => s.id)).toEqual(["s1", "s2", "s3"]);
+
+    // And that id tie-break only applies AFTER points DESC and created_at ASC:
+    const mixed: Score[] = [
+      { id: "s1", playerId: "p1", points: 10, createdAt: new Date(1000) },
+      { id: "s2", playerId: "p2", points: 20, createdAt: new Date(5000) },
+      { id: "s3", playerId: "p3", points: 20, createdAt: new Date(2000) },
+    ];
+    // points DESC -> the two 20s first; among them created_at ASC -> s3 (2000)
+    // before s2 (5000); the lone 10 last.
+    expect([...mixed].sort(compareScores).map((s) => s.id)).toEqual([
+      "s3",
+      "s2",
+      "s1",
+    ]);
   });
 
   it("combines points and tie-break ordering", async () => {
@@ -91,17 +125,26 @@ describe("InMemoryStore scores", () => {
     expect(await store.topScores(Infinity)).toHaveLength(3);
   });
 
-  it("treats an oversized finite limit as unbounded (Postgres LIMIT parity)", async () => {
+  it("preserves a large finite limit as a real bound (not unbounded)", async () => {
     const store = new InMemoryStore();
     const [a, b, c] = await makePlayers(store, 3);
     await store.addScore(a, 1);
     await store.addScore(b, 2);
     await store.addScore(c, 3);
 
-    // A finite limit above MAX_LIMIT would overflow Postgres LIMIT (bigint);
-    // both stores collapse it to "all rows" so they stay identical.
-    expect(await store.topScores(1e100)).toHaveLength(3);
+    // A large finite limit is a genuine cap: topScores(2_000_000) means "at most
+    // 2,000,000 rows", NOT "everything". With only 3 rows stored we get 3 back,
+    // and the normalized limit is preserved as-is rather than collapsed to null.
+    expect(normalizeLimit(2_000_000)).toBe(2_000_000);
     expect(await store.topScores(2_000_000)).toHaveLength(3);
+    // 1e100 is finite but not a safe integer; Math.trunc keeps it finite, so it
+    // stays a (huge) bound rather than unbounded — still a number, not null.
+    expect(normalizeLimit(1e100)).not.toBeNull();
+    // Only NON-finite input maps to unbounded (null).
+    expect(normalizeLimit(Infinity)).toBeNull();
+    expect(normalizeLimit(NaN)).toBeNull();
+    expect(normalizeLimit(undefined)).toBeNull();
+    expect(normalizeLimit(null)).toBeNull();
   });
 
   it("truncates fractional limits", async () => {
@@ -164,5 +207,34 @@ describe("InMemoryStore scores", () => {
     const first = await store.topScores(10);
     const second = await store.topScores(10);
     expect(first.map((s) => s.id)).toEqual(second.map((s) => s.id));
+  });
+
+  it("returns clones — mutating a returned score/createdAt can't leak into the store", async () => {
+    const store = new InMemoryStore();
+    const [a, b] = await makePlayers(store, 2);
+    const inserted = await store.addScore(a, 10);
+    await store.addScore(b, 20);
+
+    // Mutate the object returned by addScore, including its Date.
+    inserted.points = 9999;
+    inserted.playerId = "hacked";
+    inserted.createdAt.setTime(123456789);
+
+    // Mutate the objects returned by a topScores query too.
+    const firstQuery = await store.topScores(10);
+    for (const s of firstQuery) {
+      s.points = -1;
+      s.createdAt.setTime(999);
+    }
+
+    // Re-query: the store's own state is untouched by any of the above.
+    const rescored = await store.topScores(10);
+    expect(rescored.map((s) => s.points)).toEqual([20, 10]);
+    expect(rescored.map((s) => s.playerId)).toEqual([b, a]);
+    // created_at is still the constant clock value (epoch 0), not the mutated one.
+    expect(rescored.every((s) => s.createdAt.getTime() === 0)).toBe(true);
+    // And two queries never hand back the same Date instance.
+    const again = await store.topScores(10);
+    expect(again[0].createdAt).not.toBe(rescored[0].createdAt);
   });
 });
