@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plan: Leaderboard API Buildout</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a22; --ink: #e6e8ee; --muted: #9aa3b2;
+    --accent: #6c8cff; --amber: #f5b544; --green: #4bd07f; --red: #ff6b6b;
+    --line: #262b36; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f8fa; --panel:#fff; --ink:#1a1d24; --muted:#5a6373; --line:#e3e6ec; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family: system-ui, -apple-system, sans-serif; line-height:1.55; }
+  main { max-width: 940px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+  h1 { font-family:var(--mono); font-size:1.9rem; letter-spacing:-.02em; margin:0 0 .3rem; }
+  h2 { font-family:var(--mono); font-size:1.25rem; margin:2.4rem 0 .8rem;
+    border-bottom:1px solid var(--line); padding-bottom:.4rem; }
+  h3 { font-family:var(--mono); font-size:1rem; margin:1.4rem 0 .5rem; color:var(--accent); }
+  code, .mono { font-family:var(--mono); font-size:.86em; }
+  .meta dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .8rem; font-size:.82rem; color:var(--muted); }
+  .meta dt { font-family:var(--mono); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:1.1rem 1.3rem; margin:1rem 0; }
+  .phase { border-left:3px solid var(--accent); }
+  .phase.mig { border-left-color:var(--amber); }
+  .tag { display:inline-block; font-family:var(--mono); font-size:.68rem; text-transform:uppercase;
+    letter-spacing:.05em; padding:.12rem .5rem; border-radius:20px; border:1px solid var(--line);
+    color:var(--muted); margin-right:.35rem; }
+  .tag.mig { color:var(--amber); border-color:var(--amber); }
+  .tag.indep { color:var(--green); border-color:var(--green); }
+  .tag.dep { color:var(--accent); border-color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; margin:.5rem 0; }
+  th,td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-family:var(--mono); font-size:.75rem; text-transform:uppercase; }
+  .files td:first-child { font-family:var(--mono); white-space:nowrap; }
+  .new { color:var(--green); } .edit { color:var(--amber); }
+  .exit { background:rgba(108,140,255,.08); border:1px dashed var(--accent); border-radius:8px;
+    padding:.6rem .9rem; font-size:.86rem; margin:.7rem 0; }
+  ul { margin:.4rem 0; padding-left:1.2rem; } li { margin:.2rem 0; }
+  .legend { font-size:.8rem; color:var(--muted); }
+  .none { color:var(--green); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+
+  <header>
+    <h1>Plan: Leaderboard API Buildout</h1>
+    <p class="legend">Sandbox build plan for <code>mkv2-dryrun</code> — a throwaway repo whose
+      sole purpose is to dry-run Magic Kingdom V2 end-to-end. Status markers:
+      <code>[]</code> todo · <code>[wip]</code> in progress · <code>[x]</code> done · <code>[f]</code> failed.</p>
+    <details class="meta" open>
+      <summary>Metadata</summary>
+      <dl>
+        <dt>created</dt>      <dd>2026-07-24T00:00:00Z</dd>
+        <dt>modified</dt>     <dd>2026-07-24T00:00:00Z</dd>
+        <dt>commits</dt>      <dd>e6bd837</dd>
+        <dt>agent name</dt>   <dd>claude-opus-4-8</dd>
+        <dt>session id</dt>   <dd>mkv2-dryrun-01</dd>
+        <dt>back refs</dt>    <dd>magic-kingdom-v2-explainer.html</dd>
+        <dt>forward refs</dt> <dd>—</dd>
+      </dl>
+    </details>
+  </header>
+
+  <figure>
+    <!-- {{HERO_IMAGE: a factory line handing finished parts to a single careful installer, indigo/amber/green}} -->
+    <figcaption class="legend">Six small features, built in parallel waves, installed one at a time into one live DB.</figcaption>
+  </figure>
+
+  <section id="purpose">
+    <h2>Purpose</h2>
+    <p>Grow the baseline Leaderboard API from a single <code>/health</code> route into a small but
+      complete service: record scores, rank them, filter by season, award badges, and expose
+      per-player stats. The work is split into six phases with deliberately shaped file
+      overlaps so a parallel-build orchestrator (Magic Kingdom V2) has a real dependency graph
+      to reason about — some phases are independent, some share <code>store.ts</code> or
+      <code>server.ts</code>, and two carry migrations.</p>
+  </section>
+
+  <section id="decisions">
+    <h2>⚠ Decisions Required</h2>
+    <ul><li class="none">None. All build decisions resolved at authoring time — every phase has a
+      concrete file set, test command, and exit condition below.</li></ul>
+  </section>
+
+  <section id="milestones">
+    <h2>Milestones</h2>
+    <table>
+      <tr><th>Milestone</th><th>Phases</th><th>Due (abs)</th></tr>
+      <tr><td>M1 — Scoring core</td><td>P1, P5</td><td>2026-07-25</td></tr>
+      <tr><td>M2 — Read + write endpoints</td><td>P2, P3</td><td>2026-07-26</td></tr>
+      <tr><td>M3 — Seasons + stats</td><td>P4, P6</td><td>2026-07-27</td></tr>
+    </table>
+  </section>
+
+  <h2>Phases</h2>
+
+  <!-- ============ P1 ============ -->
+  <section class="phase mig" id="p1" data-phase="P1" data-deps="" data-migration="true">
+    <h3>[] P1 — Scores foundation <span class="tag mig">⚠ migration</span><span class="tag">M1</span><span class="tag">foundational</span></h3>
+    <p>Introduce the <code>scores</code> table and extend the persistence seam with score
+      read/write methods. Every later endpoint phase depends on this.</p>
+    <ul>
+      <li>Add migration creating <code>scores(id uuid pk, player_id uuid fk players, points int not null, created_at timestamptz default now())</code>.</li>
+      <li>Extend the <code>Store</code> interface with <code>addScore(playerId, points)</code> and <code>topScores(limit)</code>; implement in both <code>InMemoryStore</code> and <code>PgStore</code>.</li>
+      <li>Unit-test the in-memory implementation (ordering by points desc, tie-break by created_at).</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>supabase/migrations/20260724010000_scores.sql</td><td class="new">NEW</td><td>P1</td></tr>
+      <tr><td>src/db/store.ts</td><td class="edit">EDIT</td><td>P1</td></tr>
+      <tr><td>src/db/store.test.ts</td><td class="new">NEW</td><td>P1</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test && npm run check:migrations</code>
+      are all green, and the new migration applies cleanly to a fresh wave DB.</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test && npm run check:migrations</code></p>
+  </section>
+
+  <!-- ============ P5 (independent — sits in wave 1 with P1) ============ -->
+  <section class="phase" id="p5" data-phase="P5" data-deps="">
+    <h3>[] P5 — Badge computation <span class="tag indep">independent</span><span class="tag">M1</span></h3>
+    <p>Pure, self-contained logic module: given a player's scores, compute earned badges
+      (e.g. <code>first-blood</code>, <code>century</code>, <code>hot-streak</code>). Touches
+      no shared file, so it can build fully in parallel with P1.</p>
+    <ul>
+      <li>Implement <code>computeBadges(scores: number[]): Badge[]</code> as a pure function.</li>
+      <li>Exhaustively unit-test thresholds and edge cases (empty, single, boundary).</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>src/features/badges/badges.ts</td><td class="new">NEW</td><td>P5</td></tr>
+      <tr><td>src/features/badges/badges.test.ts</td><td class="new">NEW</td><td>P5</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test</code> are green with
+      full branch coverage of <code>computeBadges</code>.</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test</code></p>
+  </section>
+
+  <!-- ============ P2 ============ -->
+  <section class="phase" id="p2" data-phase="P2" data-deps="P1">
+    <h3>[] P2 — GET /leaderboard <span class="tag dep">depends: P1</span><span class="tag">M2</span></h3>
+    <p>Read endpoint returning the top N scores. Uses <code>store.topScores</code> from P1 and
+      wires a route into <code>server.ts</code>.</p>
+    <ul>
+      <li>Add <code>src/features/leaderboard/leaderboard.ts</code> exporting a handler.</li>
+      <li>Wire <code>GET /leaderboard?limit=</code> in <code>server.ts</code>.</li>
+      <li>Test against <code>InMemoryStore</code> seeded with scores (ordering, limit clamp).</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>src/features/leaderboard/leaderboard.ts</td><td class="new">NEW</td><td>P2</td></tr>
+      <tr><td>src/features/leaderboard/leaderboard.test.ts</td><td class="new">NEW</td><td>P2</td></tr>
+      <tr><td>src/server.ts</td><td class="edit">EDIT</td><td>P2</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test</code> are green and
+      <code>GET /leaderboard</code> returns ranked scores against a live wave DB.</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test</code> · switch-on: <code>curl :PORT/leaderboard</code></p>
+  </section>
+
+  <!-- ============ P3 ============ -->
+  <section class="phase" id="p3" data-phase="P3" data-deps="P1">
+    <h3>[] P3 — POST /scores + validation <span class="tag dep">depends: P1</span><span class="tag">M2</span></h3>
+    <p>Write endpoint that records a score, validated with zod. Shares <code>server.ts</code>
+      with P2 and P6 (so those three serialize on the merge-train).</p>
+    <ul>
+      <li>Add <code>src/features/scores/scores.ts</code> with a zod schema for <code>{ playerId, points }</code>.</li>
+      <li>Wire <code>POST /scores</code> in <code>server.ts</code>; 400 on invalid body.</li>
+      <li>Test valid + invalid payloads against <code>InMemoryStore</code>.</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>src/features/scores/scores.ts</td><td class="new">NEW</td><td>P3</td></tr>
+      <tr><td>src/features/scores/scores.test.ts</td><td class="new">NEW</td><td>P3</td></tr>
+      <tr><td>src/server.ts</td><td class="edit">EDIT</td><td>P3</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test</code> are green and a
+      round-trip (POST a score, then GET it back) works against a live wave DB.</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test</code></p>
+  </section>
+
+  <!-- ============ P4 ============ -->
+  <section class="phase mig" id="p4" data-phase="P4" data-deps="P1" data-migration="true">
+    <h3>[] P4 — Seasons <span class="tag mig">⚠ migration</span><span class="tag dep">depends: P1</span><span class="tag">M3</span></h3>
+    <p>Add a <code>seasons</code> table and a nullable <code>scores.season_id</code>, plus a
+      season filter on <code>topScores</code>. Edits <code>store.ts</code> (like P1), so it
+      serializes after P1 — but touches no <code>server.ts</code>, so it can run alongside the
+      endpoint phases. <b>Expand/contract:</b> the column is added nullable (old code ignores it).</p>
+    <ul>
+      <li>Migration: <code>seasons(id, name, starts_at, ends_at)</code> + <code>alter table scores add column season_id uuid null references seasons</code>.</li>
+      <li>Extend <code>topScores(limit, seasonId?)</code> in both store impls; default keeps current behavior.</li>
+      <li>Unit-test season filtering in <code>InMemoryStore</code>.</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>supabase/migrations/20260724020000_seasons.sql</td><td class="new">NEW</td><td>P4</td></tr>
+      <tr><td>src/db/store.ts</td><td class="edit">EDIT</td><td>P4</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test && npm run check:migrations</code>
+      are green, the migration applies to a fresh wave DB, and expand/contract safety is confirmed
+      (baseline code still runs against the new schema).</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test && npm run check:migrations</code></p>
+  </section>
+
+  <!-- ============ P6 ============ -->
+  <section class="phase" id="p6" data-phase="P6" data-deps="P1">
+    <h3>[] P6 — GET /players/:id/stats <span class="tag dep">depends: P1</span><span class="tag">M3</span></h3>
+    <p>Per-player stats endpoint (best score, count, average). Shares <code>server.ts</code>
+      with P2 and P3.</p>
+    <ul>
+      <li>Add <code>src/features/stats/stats.ts</code> computing stats from the store.</li>
+      <li>Wire <code>GET /players/:id/stats</code> in <code>server.ts</code>; 404 unknown player.</li>
+      <li>Test known + unknown player against <code>InMemoryStore</code>.</li>
+    </ul>
+    <table class="files"><tr><th>File</th><th>Change</th><th>Phase</th></tr>
+      <tr><td>src/features/stats/stats.ts</td><td class="new">NEW</td><td>P6</td></tr>
+      <tr><td>src/features/stats/stats.test.ts</td><td class="new">NEW</td><td>P6</td></tr>
+      <tr><td>src/server.ts</td><td class="edit">EDIT</td><td>P6</td></tr>
+    </table>
+    <div class="exit">🔁 <b>Do not exit until</b> <code>npm run typecheck && npm test</code> are green and
+      <code>GET /players/:id/stats</code> returns correct aggregates against a live wave DB.</div>
+    <p class="legend"><b>Testing:</b> <code>npm run typecheck && npm test</code></p>
+  </section>
+
+  <section id="collision-notes">
+    <h2>Collision / dependency notes (for the wave planner)</h2>
+    <table>
+      <tr><th>Shared file</th><th>Phases touching it</th><th>Consequence</th></tr>
+      <tr><td>src/db/store.ts</td><td>P1, P4</td><td>P4 serializes after P1</td></tr>
+      <tr><td>src/server.ts</td><td>P2, P3, P6</td><td>these three serialize among themselves</td></tr>
+      <tr><td>(none)</td><td>P5</td><td>fully independent — wave 1 with P1</td></tr>
+    </table>
+    <p class="legend">All of P2/P3/P4/P6 depend on P1 (scores store methods). P4 (store.ts) is
+      disjoint from P2/P3/P6 (server.ts), so it can float alongside one of them. Two phases carry
+      migrations (P1, P4) → the merge-train installs those one at a time.</p>
+  </section>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "mkv2-dryrun",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway sandbox to dry-run Magic Kingdom V2 end-to-end",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "migrate": "node scripts/migrate.mjs",
+    "check:migrations": "node scripts/check-migrations.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,22 @@
+# The single "production" DB for the sandbox.
+# ONLY the careful installer (MK V2 back-half) writes here. Wave agents never do.
+services:
+  prod:
+    image: postgres:16-alpine
+    container_name: mkv2-prod
+    environment:
+      POSTGRES_USER: mkv2
+      POSTGRES_PASSWORD: mkv2
+      POSTGRES_DB: mkv2
+    ports:
+      - "5500:5432"
+    volumes:
+      - mkv2_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mkv2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mkv2_prod_data:
