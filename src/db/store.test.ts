@@ -3,6 +3,7 @@ import {
   InMemoryStore,
   PgStore,
   normalizeLimit,
+  normalizeSeasonId,
   compareScores,
   type Score,
 } from "./store.js";
@@ -372,5 +373,53 @@ describe("InMemoryStore scores", () => {
     // And two queries never hand back the same Date instance.
     const again = await store.topScores(10);
     expect(again[0].createdAt).not.toBe(rescored[0].createdAt);
+  });
+
+  it("topScores returns the CANONICAL (lowercase) seasonId, matching addScore (FIX A)", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Mint enough seasons that the id carries a hex letter, so its uppercase
+    // spelling is a genuinely different string.
+    let last!: Awaited<ReturnType<InMemoryStore["addSeason"]>>;
+    for (let i = 0; i < 10; i++) {
+      last = await store.addSeason(`S${i}`, new Date(0), new Date(1000));
+    }
+    const lower = last.id;
+    const upper = lower.toUpperCase();
+    expect(lower).toMatch(/[a-f]/);
+    expect(upper).not.toBe(lower);
+
+    const written = await store.addScore(a, 10, upper);
+    // Read back with the SAME uppercase argument the caller used.
+    const read = await store.topScores(10, upper);
+    expect(read).toHaveLength(1);
+    // Returned seasonId is the canonical lowercase, NOT the raw uppercase arg,
+    // and equals both normalizeSeasonId(X) and what addScore returned.
+    expect(read[0].seasonId).toBe(normalizeSeasonId(upper));
+    expect(read[0].seasonId).toBe(written.seasonId);
+    expect(read[0].seasonId).toBe(lower);
+  });
+
+  it("addSeason validates its date inputs (FIX C)", async () => {
+    const store = new InMemoryStore();
+    // Invalid Date (getTime() NaN) — InMemory would previously store it while
+    // Postgres rejects on serialization; now both throw the same domain error.
+    await expect(
+      store.addSeason("bad", new Date("nope"), new Date(1000)),
+    ).rejects.toThrow(/invalid season dates/);
+    await expect(
+      store.addSeason("bad", new Date(0), new Date("nope")),
+    ).rejects.toThrow(/invalid season dates/);
+    // Inverted / empty range (endsAt <= startsAt) is rejected too.
+    await expect(
+      store.addSeason("inverted", new Date(1000), new Date(500)),
+    ).rejects.toThrow(/invalid season dates/);
+    await expect(
+      store.addSeason("empty", new Date(1000), new Date(1000)),
+    ).rejects.toThrow(/invalid season dates/);
+    // A valid season still succeeds unchanged.
+    const ok = await store.addSeason("good", new Date(0), new Date(1000));
+    expect(ok.startsAt.getTime()).toBe(0);
+    expect(ok.endsAt.getTime()).toBe(1000);
   });
 });

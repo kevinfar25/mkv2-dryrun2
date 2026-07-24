@@ -86,6 +86,24 @@ export function normalizeSeasonId(seasonId: string): string {
   return seasonId.toLowerCase();
 }
 
+// Shared season-date sanity check so InMemoryStore and PgStore reject the SAME
+// inputs. InMemoryStore would otherwise store an Invalid Date (getTime() NaN)
+// that Postgres rejects on serialization — a parity break. Also forbids
+// inverted/empty ranges (endsAt <= startsAt), which both stores previously
+// accepted. Throws a stable domain Error BEFORE any store mutation.
+export function assertValidSeasonDates(startsAt: Date, endsAt: Date): void {
+  if (Number.isNaN(startsAt.getTime()) || Number.isNaN(endsAt.getTime())) {
+    throw new Error(
+      `invalid season dates: startsAt/endsAt must be valid Dates`,
+    );
+  }
+  if (endsAt.getTime() <= startsAt.getTime()) {
+    throw new Error(
+      `invalid season dates: endsAt must be after startsAt`,
+    );
+  }
+}
+
 // limit contract: a finite value is clamped to a non-negative integer and
 // preserved AS-IS (floats truncated via Math.trunc, negatives -> 0); any
 // non-finite value (undefined/null/NaN/Infinity) means "no limit" — return ALL
@@ -163,6 +181,7 @@ export class InMemoryStore implements Store {
   }
 
   async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
+    assertValidSeasonDates(startsAt, endsAt);
     const id = seqToUuid(++this.seasonSeq);
     const season: Season = {
       id,
@@ -248,8 +267,9 @@ export class InMemoryStore implements Store {
     const rows = n === null ? sorted : sorted.slice(0, n);
     // Match PgStore's projection exactly: the default path never surfaces
     // season_id (Pg can't select it without breaking expand/contract), so it
-    // reports null; the filtered path reports the season it filtered on.
-    const outSeason = seasonId ?? null;
+    // reports null; the filtered path reports the CANONICAL (lowercase) season
+    // it filtered on — identical to the value addScore returns for that id.
+    const outSeason = normalizedFilter;
     return rows.map((s) => ({ ...clone(s), seasonId: outSeason }));
   }
 
@@ -282,6 +302,7 @@ export class PgStore implements Store {
   }
 
   async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
+    assertValidSeasonDates(startsAt, endsAt);
     const { rows } = await this.pool.query<{
       id: string;
       name: string;
@@ -390,9 +411,10 @@ export class PgStore implements Store {
       points: r.points,
       createdAt: r.created_at,
       // The default projection doesn't select season_id; callers that need it
-      // pass a seasonId (and already know which season they filtered on). Keep
-      // the shape consistent with the Score type.
-      seasonId: seasonId ?? null,
+      // pass a seasonId (and already know which season they filtered on). Report
+      // the CANONICAL (lowercase) form so it matches the value addScore returns
+      // for the same id, even when the caller passed uppercase.
+      seasonId: seasonId == null ? null : normalizeSeasonId(seasonId),
     }));
   }
 
