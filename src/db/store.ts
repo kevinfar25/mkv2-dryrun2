@@ -50,13 +50,16 @@ export function assertValidPoints(points: number): void {
 //
 // A large finite limit is a genuine bound, NOT a request for everything:
 // `topScores(2_000_000)` must cap at 2,000,000 rows in both stores. Only
-// non-finite input collapses to unbounded. `Number.isFinite` already rejects
-// NaN/Infinity, and any finite number is a safe integer after Math.trunc within
-// the JS safe-integer range that Math.trunc yields here, so no arbitrary cap is
-// imposed.
+// non-finite input collapses to unbounded. A finite limit is clamped to the
+// Postgres-legal safe range `[0, Number.MAX_SAFE_INTEGER]`: every value in that
+// range is a legal Postgres `LIMIT`, so InMemoryStore and PgStore agree for ALL
+// inputs (absurd values like 1e100 clamp to MAX_SAFE_INTEGER instead of
+// diverging — Postgres cannot accept `LIMIT 1e100`).
 export function normalizeLimit(limit?: number | null): number | null {
-  if (limit == null || !Number.isFinite(limit)) return null;
-  return Math.max(0, Math.trunc(limit));
+  const n = Number.isFinite(limit)
+    ? Math.min(Math.max(0, Math.trunc(limit as number)), Number.MAX_SAFE_INTEGER)
+    : null;
+  return n;
 }
 
 // Deterministic ordering contract, IDENTICAL in both stores:

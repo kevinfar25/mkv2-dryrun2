@@ -137,9 +137,10 @@ describe("InMemoryStore scores", () => {
     // and the normalized limit is preserved as-is rather than collapsed to null.
     expect(normalizeLimit(2_000_000)).toBe(2_000_000);
     expect(await store.topScores(2_000_000)).toHaveLength(3);
-    // 1e100 is finite but not a safe integer; Math.trunc keeps it finite, so it
-    // stays a (huge) bound rather than unbounded — still a number, not null.
-    expect(normalizeLimit(1e100)).not.toBeNull();
+    // 1e100 is finite but exceeds the Postgres-legal safe range, so it clamps to
+    // MAX_SAFE_INTEGER rather than diverging between stores. 2_000_000 is within
+    // range and is preserved exactly (asserted above).
+    expect(normalizeLimit(1e100)).toBe(Number.MAX_SAFE_INTEGER);
     // Only NON-finite input maps to unbounded (null).
     expect(normalizeLimit(Infinity)).toBeNull();
     expect(normalizeLimit(NaN)).toBeNull();
