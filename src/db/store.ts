@@ -21,6 +21,28 @@ export interface Store {
   health(): Promise<boolean>;
 }
 
+/**
+ * Shared validation/normalization so InMemoryStore and PgStore stay
+ * BEHAVIOURALLY IDENTICAL (repo rule).
+ */
+
+// `scores.points` is `int not null`. Reject anything that is not a finite
+// integer (this also rejects NaN/Infinity/floats) so NaN can never reach the
+// sort comparator `b.points - a.points`.
+export function assertValidPoints(points: number): void {
+  if (!Number.isInteger(points)) {
+    throw new Error(`invalid points: ${points} (must be a finite integer)`);
+  }
+}
+
+// limit contract: a finite value is clamped to a non-negative integer; any
+// non-finite value (including undefined/NaN/Infinity) means "no limit" —
+// return ALL rows. Represented as `null`: Postgres reads `LIMIT NULL` as
+// unbounded, and InMemoryStore skips the slice.
+export function normalizeLimit(limit: number): number | null {
+  return Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : null;
+}
+
 export class InMemoryStore implements Store {
   private players = new Map<string, Player>();
   private scores: Score[] = [];
@@ -39,6 +61,12 @@ export class InMemoryStore implements Store {
   }
 
   async addScore(playerId: string, points: number): Promise<Score> {
+    assertValidPoints(points);
+    // Enforce the same FK contract PgStore gets for free from
+    // scores.player_id -> players.id: unknown players are rejected.
+    if (!this.players.has(playerId)) {
+      throw new Error(`unknown player: ${playerId}`);
+    }
     const n = ++this.scoreSeq;
     // Monotonic created_at per insertion so ordering is deterministic and
     // mirrors Postgres, where each INSERT's now() advances.
@@ -53,14 +81,14 @@ export class InMemoryStore implements Store {
   }
 
   async topScores(limit: number): Promise<Score[]> {
-    return [...this.scores]
-      .sort(
-        (a, b) =>
-          b.points - a.points ||
-          a.createdAt.getTime() - b.createdAt.getTime() ||
-          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-      )
-      .slice(0, Math.max(0, limit));
+    const n = normalizeLimit(limit);
+    const sorted = [...this.scores].sort(
+      (a, b) =>
+        b.points - a.points ||
+        a.createdAt.getTime() - b.createdAt.getTime() ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
+    return n === null ? sorted : sorted.slice(0, n);
   }
 
   async health(): Promise<boolean> {
@@ -92,6 +120,9 @@ export class PgStore implements Store {
   }
 
   async addScore(playerId: string, points: number): Promise<Score> {
+    // Same points contract as InMemoryStore. Unknown players are rejected by
+    // the scores.player_id -> players.id FK (the query throws).
+    assertValidPoints(points);
     const { rows } = await this.pool.query<{
       id: string;
       player_id: string;
@@ -114,8 +145,10 @@ export class PgStore implements Store {
     }>(
       // Deterministic, identical to InMemoryStore: points desc, then created_at
       // asc (earliest first), then id as a final stable tie-break.
+      // LIMIT NULL is unbounded in Postgres, matching normalizeLimit's "all
+      // rows" contract for non-finite input.
       "SELECT id, player_id, points, created_at FROM scores ORDER BY points DESC, created_at ASC, id ASC LIMIT $1",
-      [Math.max(0, limit)],
+      [normalizeLimit(limit)],
     );
     return rows.map((r) => ({
       id: r.id,
