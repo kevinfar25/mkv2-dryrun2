@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { once } from "node:events";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import { InMemoryStore } from "../../db/store.js";
 import { createApp } from "../../server.js";
 import { scoreInputSchema } from "./scores.js";
@@ -47,7 +47,16 @@ describe("scoreInputSchema (unit)", () => {
   it("rejects missing/empty playerId", () => {
     expect(scoreInputSchema.safeParse({ points: 1 }).success).toBe(false);
     expect(scoreInputSchema.safeParse({ playerId: "", points: 1 }).success).toBe(false);
-    expect(scoreInputSchema.safeParse({ playerId: "   ", points: 1 }).success).toBe(false);
+  });
+
+  it("does NOT trim playerId — a whitespace-padded id passes the schema unchanged", () => {
+    // ids are EXACT/opaque to the store, so the schema must not rewrite them.
+    // A padded (non-empty) id is a valid string here; the store — not the schema —
+    // decides it's unknown. (A whitespace-ONLY id is also non-empty, so it passes.)
+    const r = scoreInputSchema.safeParse({ playerId: " p1 ", points: 1 });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.playerId).toBe(" p1 "); // NOT "p1"
+    expect(scoreInputSchema.safeParse({ playerId: "   ", points: 1 }).success).toBe(true);
   });
 
   it("rejects non-integer / out-of-range points", () => {
@@ -210,6 +219,73 @@ describe("POST /scores (HTTP, against InMemoryStore)", () => {
       expect(res.status).toBe(400);
       expect(res.json.error).toBe("unknown_player");
     } finally {
+      app.close();
+    }
+  });
+
+  it("does NOT trim playerId: a whitespace-padded id that doesn't EXACTLY match a seeded player 400s (unknown_player), never 201", async () => {
+    const store = new InMemoryStore();
+    const player = await store.addPlayer("alice"); // real id, e.g. "p1"
+    const { app, port } = await boot(store);
+    try {
+      const padded = ` ${player.id} `; // " p1 " — trimming would forge a hit on p1.
+      const res = await post(port, JSON.stringify({ playerId: padded, points: 5 }));
+      expect(res.status).toBe(400);
+      expect(res.json.error).toBe("unknown_player");
+      // The real player got NO score smuggled in via the padded id.
+      expect(await store.topScores()).toEqual([]);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("rejects an oversized STREAMED body immediately (400 body_too_large) and does not hang when the client stalls without EOF", async () => {
+    const store = new InMemoryStore();
+    const { app, port } = await boot(store);
+    // Raw socket: send headers + >1MB of body, then STALL — never send `end`.
+    const socket = net.connect(port, "127.0.0.1");
+    try {
+      await once(socket, "connect");
+      const responded = new Promise<string>((resolve, reject) => {
+        let buf = "";
+        socket.on("data", (d: Buffer) => {
+          buf += d.toString("utf8");
+          if (buf.includes("\r\n\r\n")) resolve(buf); // got full response head+body.
+        });
+        // The server destroys the connection right after the 400, so the client's
+        // in-flight writes may surface EPIPE/ECONNRESET — that's the teardown we
+        // WANT, not a test failure. Only a genuinely different error is fatal.
+        socket.on("error", (err: NodeJS.ErrnoException) => {
+          if (err.code === "EPIPE" || err.code === "ECONNRESET") return;
+          reject(err);
+        });
+      });
+
+      // Chunked transfer so we can stream past the limit without a Content-Length
+      // and then simply stop (no terminating 0-length chunk = no EOF).
+      socket.write(
+        `POST /scores HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n`,
+      );
+      const chunk = "x".repeat(100_000);
+      const hexLen = chunk.length.toString(16);
+      for (let sent = 0; sent <= 1_100_000; sent += chunk.length) {
+        // A write may throw once the peer is gone — ignore, that's the teardown.
+        try {
+          socket.write(`${hexLen}\r\n${chunk}\r\n`); // valid chunks, but we NEVER close.
+        } catch {
+          break;
+        }
+      }
+
+      // The server must respond promptly despite no EOF; race against a timeout.
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("server hung: no response before timeout")), 5_000),
+      );
+      const raw = await Promise.race([responded, timeout]);
+      expect(raw).toContain("400");
+      expect(raw).toContain("body_too_large");
+    } finally {
+      socket.destroy();
       app.close();
     }
   });

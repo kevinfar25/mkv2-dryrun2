@@ -19,33 +19,45 @@ class BodyTooLargeError extends Error {
 }
 
 // Read the full request body as UTF-8 text, bounded so a client can't stream an
-// unbounded payload into memory. On exceeding the limit we STOP buffering and
-// drain/discard the remaining bytes (without destroying the socket) so the HTTP
-// response — a 400 — can still be written back to the client.
+// unbounded payload into memory. The MOMENT the byte budget is exceeded we STOP
+// reading (remove the data listener + pause the stream) and reject with
+// BodyTooLargeError right away — we do NOT wait for `end`. This defeats a
+// slow/malicious client that streams past the limit then stalls (never sending
+// `end`), which under an end-only check would keep the request open indefinitely
+// (slow-drain resource exhaustion). The route maps the rejection to a 400 and then
+// destroys the request to tear the connection down — teardown happens AFTER the
+// 400 is written (destroying the request here would kill the shared socket before
+// the response could be flushed).
 const MAX_BODY_BYTES = 1_000_000;
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    let tooLarge = false;
-    req.on("data", (c: Buffer) => {
-      if (tooLarge) return; // already over limit — drain and discard.
+    let settled = false;
+    const onData = (c: Buffer) => {
+      if (settled) return;
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        tooLarge = true;
+        settled = true;
         chunks.length = 0; // release what we buffered.
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (tooLarge) {
+        req.removeListener("data", onData);
+        req.pause(); // stop pulling bytes; the route will destroy after the 400.
         reject(new BodyTooLargeError());
         return;
       }
+      chunks.push(c);
+    };
+    req.on("data", onData);
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
       resolve(Buffer.concat(chunks).toString("utf8"));
     });
-    req.on("error", reject);
+    req.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -87,6 +99,12 @@ export function createApp(store: Store) {
           parsed = JSON.parse(await readBody(req));
         } catch (err) {
           if (err instanceof BodyTooLargeError) {
+            // Tear the connection down ONCE the 400 has flushed — destroying the
+            // shared socket earlier would reset the response the client is meant
+            // to read (the "no socket reset" invariant). Waiting for `finish`
+            // guarantees the 400 is on the wire before we stop a stalled client
+            // from holding the (un-drained) request open.
+            res.once("finish", () => req.destroy());
             json(res, 400, { error: "body_too_large" });
             return;
           }
