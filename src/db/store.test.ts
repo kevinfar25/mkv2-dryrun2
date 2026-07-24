@@ -199,11 +199,46 @@ describe("InMemoryStore scores", () => {
     ).rejects.toThrow(/invalid points/);
   });
 
+  it("rejects a malformed seasonId on write with one domain error (uuid parity)", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Postgres' `uuid` column rejects a non-UUID literal (22P02) before the FK
+    // is checked; InMemoryStore rejects the same shape up front so a seasonal
+    // write can't pass here yet fail against Postgres.
+    await expect(store.addScore(a, 10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+    await expect(
+      store.addScore(a, 10, "11111111-1111-1111-1111"),
+    ).rejects.toThrow(/invalid seasonId/);
+  });
+
+  it("rejects an unknown (valid-format) seasonId on write, like the FK", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // Well-formed but never registered -> Postgres would raise a season FK
+    // violation (23503); InMemoryStore rejects it identically.
+    await expect(
+      store.addScore(a, 10, "99999999-9999-9999-9999-999999999999"),
+    ).rejects.toThrow(/unknown season/);
+  });
+
+  it("also rejects a malformed seasonId on the read filter (uuid parity)", async () => {
+    const store = new InMemoryStore();
+    // A non-null read filter is compared against the `uuid` column, so a
+    // malformed id errors (22P02) rather than returning rows.
+    await expect(store.topScores(10, "not-a-uuid")).rejects.toThrow(
+      /invalid seasonId/,
+    );
+  });
+
   it("filters topScores by season when a seasonId is passed", async () => {
     const store = new InMemoryStore();
     const [a, b, c] = await makePlayers(store, 3);
-    const s1 = "11111111-1111-1111-1111-111111111111";
-    const s2 = "22222222-2222-2222-2222-222222222222";
+    // Seasons must exist before a score can reference them (parity with the
+    // Postgres scores.season_id FK).
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
+    const s2 = (await store.addSeason("S2", new Date(0), new Date(1000))).id;
     await store.addScore(a, 10, s1);
     await store.addScore(b, 30, s2);
     await store.addScore(c, 20, s1);
@@ -223,7 +258,7 @@ describe("InMemoryStore scores", () => {
   it("default path (no seasonId) keeps current behavior across seasons", async () => {
     const store = new InMemoryStore();
     const [a, b, c] = await makePlayers(store, 3);
-    const s1 = "11111111-1111-1111-1111-111111111111";
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
     await store.addScore(a, 10, s1);
     await store.addScore(b, 30); // no season
     await store.addScore(c, 20, s1);
@@ -240,10 +275,13 @@ describe("InMemoryStore scores", () => {
   it("returns an empty array for a seasonId with no matching scores", async () => {
     const store = new InMemoryStore();
     const [a, b] = await makePlayers(store, 2);
-    const s1 = "11111111-1111-1111-1111-111111111111";
+    const s1 = (await store.addSeason("S1", new Date(0), new Date(1000))).id;
     await store.addScore(a, 10, s1);
     await store.addScore(b, 20, s1);
 
+    // Reading by a valid-but-unused season yields no rows (the read path does
+    // NOT enforce season existence — only the write FK does, mirroring Postgres
+    // `WHERE season_id = $2` returning zero rows rather than erroring).
     const none = await store.topScores(10, "99999999-9999-9999-9999-999999999999");
     expect(none).toEqual([]);
 

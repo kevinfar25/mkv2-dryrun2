@@ -1,6 +1,12 @@
 import pg from "pg";
 
 export type Player = { id: string; name: string };
+export type Season = {
+  id: string;
+  name: string;
+  startsAt: Date;
+  endsAt: Date;
+};
 export type Score = {
   id: string;
   playerId: string;
@@ -20,6 +26,12 @@ export type Score = {
 export interface Store {
   addPlayer(name: string): Promise<Player>;
   getPlayer(id: string): Promise<Player | null>;
+  // Register a season so scores can be attached to it. Mirrors the `seasons`
+  // table (id uuid pk, name/starts_at/ends_at not null). Needed so BOTH stores
+  // can enforce the same "season must exist" contract that Postgres gets from
+  // the scores.season_id FK — without it InMemoryStore would accept a seasonId
+  // Postgres would reject, breaking store parity.
+  addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season>;
   addScore(playerId: string, points: number, seasonId?: string | null): Promise<Score>;
   // topScores filters by season ONLY when seasonId is passed. Omitting it (the
   // default path) must not touch the season_id column at all, so pre-migration
@@ -47,6 +59,21 @@ export function assertValidPoints(points: number): void {
     throw new Error(
       `invalid points: ${points} (must be an int32 integer in [${INT32_MIN}, ${INT32_MAX}])`,
     );
+  }
+}
+
+// `scores.season_id` is a Postgres `uuid` column. Postgres rejects a malformed
+// UUID literal with 22P02 (invalid_text_representation) BEFORE the FK is ever
+// checked, so InMemoryStore must reject the same shapes up front or a seasonal
+// write could pass a unit test yet fail against Postgres. Validate in shared
+// code so both stores throw the SAME domain error on the SAME input, without
+// InMemoryStore depending on Postgres error codes. Canonical hyphenated 8-4-4-4-12
+// hex (case-insensitive) — the form every caller here uses.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function assertValidSeasonId(seasonId: string): void {
+  if (!UUID_RE.test(seasonId)) {
+    throw new Error(`invalid seasonId: ${seasonId} (must be a UUID)`);
   }
 }
 
@@ -89,10 +116,19 @@ function clone(s: Score): Score {
   return { ...s, createdAt: new Date(s.createdAt.getTime()) };
 }
 
+// Deterministic UUID-format id from a counter, so InMemoryStore-minted season
+// ids pass the same `uuid`-shape validation Postgres enforces (and stay stable
+// across test runs — no Math.random). `00000000-0000-0000-0000-<seq>`.
+function seqToUuid(n: number): string {
+  return `00000000-0000-0000-0000-${n.toString(16).padStart(12, "0")}`;
+}
+
 export class InMemoryStore implements Store {
   private players = new Map<string, Player>();
+  private seasons = new Map<string, Season>();
   private scores: Score[] = [];
   private seq = 0;
+  private seasonSeq = 0;
   private scoreSeq = 0;
 
   // All in-memory scores share one created_at VALUE. Postgres `now()` is the
@@ -117,6 +153,18 @@ export class InMemoryStore implements Store {
     return this.players.get(id) ?? null;
   }
 
+  async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
+    const id = seqToUuid(++this.seasonSeq);
+    const season: Season = {
+      id,
+      name,
+      startsAt: new Date(startsAt.getTime()),
+      endsAt: new Date(endsAt.getTime()),
+    };
+    this.seasons.set(id, season);
+    return { ...season };
+  }
+
   async addScore(
     playerId: string,
     points: number,
@@ -127,6 +175,16 @@ export class InMemoryStore implements Store {
     // scores.player_id -> players.id: unknown players are rejected.
     if (!this.players.has(playerId)) {
       throw new Error(`unknown player: ${playerId}`);
+    }
+    // Season parity: only when a season is attached. Match Postgres' `uuid`
+    // column (reject malformed ids) AND its scores.season_id FK (reject unknown
+    // seasons) so a seasonal write behaves identically in both stores. The
+    // default path (seasonId null) requires no season, exactly like PgStore.
+    if (seasonId != null) {
+      assertValidSeasonId(seasonId);
+      if (!this.seasons.has(seasonId)) {
+        throw new Error(`unknown season: ${seasonId}`);
+      }
     }
     const n = ++this.scoreSeq;
     const score: Score = {
@@ -147,6 +205,12 @@ export class InMemoryStore implements Store {
     seasonId?: string | null,
   ): Promise<Score[]> {
     const n = normalizeLimit(limit);
+    // A non-null read filter is compared against the `uuid` column, so Postgres
+    // rejects a malformed id (22P02) before returning rows — validate the same
+    // shape here for parity. `null` filters the season-less rows (no shape).
+    if (seasonId != null) {
+      assertValidSeasonId(seasonId);
+    }
     // Season filter is opt-in: only when a seasonId is explicitly passed do we
     // touch season_id at all. The default path is byte-for-byte the old
     // behavior (mirrors PgStore, whose default query never names season_id).
@@ -191,6 +255,25 @@ export class PgStore implements Store {
     return rows[0] ?? null;
   }
 
+  async addSeason(name: string, startsAt: Date, endsAt: Date): Promise<Season> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      name: string;
+      starts_at: Date;
+      ends_at: Date;
+    }>(
+      "INSERT INTO seasons(name, starts_at, ends_at) VALUES($1, $2, $3) RETURNING id, name, starts_at, ends_at",
+      [name, startsAt, endsAt],
+    );
+    const r = rows[0];
+    return {
+      id: r.id,
+      name: r.name,
+      startsAt: r.starts_at,
+      endsAt: r.ends_at,
+    };
+  }
+
   async addScore(
     playerId: string,
     points: number,
@@ -198,6 +281,11 @@ export class PgStore implements Store {
   ): Promise<Score> {
     // Same points contract as InMemoryStore.
     assertValidPoints(points);
+    // Same seasonId shape contract: reject malformed ids up front (identical
+    // domain error to InMemoryStore) instead of relying on Postgres' 22P02.
+    if (seasonId != null) {
+      assertValidSeasonId(seasonId);
+    }
     try {
       // Expand/contract: the DEFAULT path never names season_id, so this store
       // still writes cleanly against the pre-migration schema. Only a caller
@@ -223,12 +311,16 @@ export class PgStore implements Store {
         seasonId: r.season_id ?? null,
       };
     } catch (err) {
-      // Normalize the unknown-player rejection to the SAME domain error
-      // InMemoryStore throws. Postgres surfaces a missing FK as 23503
-      // (foreign_key_violation) and a malformed UUID as 22P02
-      // (invalid_text_representation); both mean "unknown player".
-      const code = (err as { code?: string })?.code;
-      if (code === "23503" || code === "22P02") {
+      // Normalize FK/format rejections to the SAME domain errors InMemoryStore
+      // throws. 23503 (foreign_key_violation) can come from EITHER fkey, so the
+      // constraint name disambiguates unknown-season from unknown-player; a
+      // malformed player UUID surfaces as 22P02 (season ids are pre-validated
+      // above, so 22P02 here can only be the player id).
+      const e = err as { code?: string; constraint?: string };
+      if (e.code === "23503" && e.constraint?.includes("season")) {
+        throw new Error(`unknown season: ${seasonId}`);
+      }
+      if (e.code === "23503" || e.code === "22P02") {
         throw new Error(`unknown player: ${playerId}`);
       }
       throw err;
@@ -244,6 +336,11 @@ export class PgStore implements Store {
     // clause is added ONLY when a caller explicitly passes a seasonId; the
     // selected columns stay identical either way.
     const filtered = seasonId !== undefined;
+    // Parity with InMemoryStore: a non-null read filter is validated up front so
+    // a malformed id fails identically instead of as a raw Postgres 22P02.
+    if (seasonId != null) {
+      assertValidSeasonId(seasonId);
+    }
     const where = filtered ? "WHERE season_id IS NOT DISTINCT FROM $2 " : "";
     // Deterministic, identical to InMemoryStore: points desc, then created_at
     // asc (earliest first), then id as the final stable tie-break.
