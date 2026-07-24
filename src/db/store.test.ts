@@ -25,7 +25,7 @@ describe("InMemoryStore scores", () => {
     expect(top.map((s) => s.playerId)).toEqual([b, c, a]);
   });
 
-  it("tie-breaks equal points by created_at ascending (earliest first)", async () => {
+  it("tie-breaks equal points AND equal created_at by id (insertion order)", async () => {
     const store = new InMemoryStore();
     const [a, b, c] = await makePlayers(store, 3);
     const first = await store.addScore(a, 50);
@@ -33,10 +33,11 @@ describe("InMemoryStore scores", () => {
     const third = await store.addScore(c, 50);
 
     const top = await store.topScores(10);
+    // All three share points AND created_at, so the deterministic `id ASC`
+    // tie-break (not a fabricated strictly-increasing clock) decides ordering.
+    expect(top[0].createdAt.getTime()).toBe(top[1].createdAt.getTime());
+    expect(top[1].createdAt.getTime()).toBe(top[2].createdAt.getTime());
     expect(top.map((s) => s.id)).toEqual([first.id, second.id, third.id]);
-    // created_at must be strictly increasing across insertions.
-    expect(top[0].createdAt.getTime()).toBeLessThan(top[1].createdAt.getTime());
-    expect(top[1].createdAt.getTime()).toBeLessThan(top[2].createdAt.getTime());
   });
 
   it("combines points and tie-break ordering", async () => {
@@ -83,10 +84,24 @@ describe("InMemoryStore scores", () => {
     await store.addScore(b, 2);
     await store.addScore(c, 3);
 
-    // undefined / NaN / Infinity all mean "no limit" -> all rows.
-    expect(await store.topScores(undefined as unknown as number)).toHaveLength(3);
+    // undefined / null / NaN / Infinity all mean "no limit" -> all rows.
+    expect(await store.topScores(undefined)).toHaveLength(3);
+    expect(await store.topScores(null)).toHaveLength(3);
     expect(await store.topScores(NaN)).toHaveLength(3);
     expect(await store.topScores(Infinity)).toHaveLength(3);
+  });
+
+  it("treats an oversized finite limit as unbounded (Postgres LIMIT parity)", async () => {
+    const store = new InMemoryStore();
+    const [a, b, c] = await makePlayers(store, 3);
+    await store.addScore(a, 1);
+    await store.addScore(b, 2);
+    await store.addScore(c, 3);
+
+    // A finite limit above MAX_LIMIT would overflow Postgres LIMIT (bigint);
+    // both stores collapse it to "all rows" so they stay identical.
+    expect(await store.topScores(1e100)).toHaveLength(3);
+    expect(await store.topScores(2_000_000)).toHaveLength(3);
   });
 
   it("truncates fractional limits", async () => {
@@ -99,12 +114,17 @@ describe("InMemoryStore scores", () => {
     expect(await store.topScores(2.9)).toHaveLength(2);
   });
 
-  it("rejects addScore for an unknown player", async () => {
+  it("rejects addScore for an unknown player with one domain error", async () => {
     const store = new InMemoryStore();
-    // No player created with this id -> must reject (PgStore FK parity).
+    // PgStore normalizes BOTH a missing FK (23503, valid-but-absent id) and a
+    // malformed UUID (22P02) to the same `unknown player` error; InMemoryStore
+    // rejects any id not in its map, covering both shapes identically.
     await expect(store.addScore("does-not-exist", 10)).rejects.toThrow(
       /unknown player/,
     );
+    await expect(
+      store.addScore("00000000-0000-0000-0000-000000000000", 10),
+    ).rejects.toThrow(/unknown player/);
   });
 
   it("rejects non-integer / NaN / Infinity points", async () => {
@@ -113,6 +133,26 @@ describe("InMemoryStore scores", () => {
     await expect(store.addScore(a, NaN)).rejects.toThrow(/invalid points/);
     await expect(store.addScore(a, Infinity)).rejects.toThrow(/invalid points/);
     await expect(store.addScore(a, 3.5)).rejects.toThrow(/invalid points/);
+  });
+
+  it("enforces int32 bounds on points (Postgres `int` parity)", async () => {
+    const store = new InMemoryStore();
+    const [a] = await makePlayers(store, 1);
+    // In-range boundaries are accepted.
+    await expect(store.addScore(a, 2147483647)).resolves.toMatchObject({
+      points: 2147483647,
+    });
+    await expect(store.addScore(a, -2147483648)).resolves.toMatchObject({
+      points: -2147483648,
+    });
+    // Just outside int32, plus values above MAX_SAFE_INTEGER, are rejected —
+    // InMemory used to accept these while Postgres `int` would overflow.
+    await expect(store.addScore(a, 2147483648)).rejects.toThrow(/invalid points/);
+    await expect(store.addScore(a, -2147483649)).rejects.toThrow(/invalid points/);
+    await expect(store.addScore(a, 1e100)).rejects.toThrow(/invalid points/);
+    await expect(
+      store.addScore(a, Number.MAX_SAFE_INTEGER + 1),
+    ).rejects.toThrow(/invalid points/);
   });
 
   it("does not mutate internal state when sorting", async () => {
