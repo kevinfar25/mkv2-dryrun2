@@ -8,23 +8,43 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+// Typed error for an over-limit request body. The route maps this to a
+// controlled 400 rather than letting a huge payload buffer into memory OR
+// tearing the socket down (a reset the client sees as a network failure).
+class BodyTooLargeError extends Error {
+  constructor() {
+    super("body_too_large");
+    this.name = "BodyTooLargeError";
+  }
+}
+
 // Read the full request body as UTF-8 text, bounded so a client can't stream an
-// unbounded payload into memory.
+// unbounded payload into memory. On exceeding the limit we STOP buffering and
+// drain/discard the remaining bytes (without destroying the socket) so the HTTP
+// response — a 400 — can still be written back to the client.
 const MAX_BODY_BYTES = 1_000_000;
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
     req.on("data", (c: Buffer) => {
+      if (tooLarge) return; // already over limit — drain and discard.
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        reject(new Error("payload too large"));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0; // release what we buffered.
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => {
+      if (tooLarge) {
+        reject(new BodyTooLargeError());
+        return;
+      }
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }
@@ -65,7 +85,11 @@ export function createApp(store: Store) {
         let parsed: unknown;
         try {
           parsed = JSON.parse(await readBody(req));
-        } catch {
+        } catch (err) {
+          if (err instanceof BodyTooLargeError) {
+            json(res, 400, { error: "body_too_large" });
+            return;
+          }
           json(res, 400, { error: "invalid_json" });
           return;
         }

@@ -10,7 +10,9 @@ import { INT32_MIN, INT32_MAX } from "../../db/store.js";
 //   - points: an integer within the store's accepted int32 range
 //     [INT32_MIN, INT32_MAX] — identical bound to assertValidPoints, so a body
 //     that passes this schema will never trip the store's own guard.
-export const scoreInputSchema = z.object({
+// `strictObject` so an unknown key (e.g. a smuggled `admin: true`) is REJECTED
+// rather than silently dropped — the HTTP layer must 400 such a body, not 201.
+export const scoreInputSchema = z.strictObject({
   playerId: z.string().trim().min(1),
   points: z.number().int().min(INT32_MIN).max(INT32_MAX),
 });

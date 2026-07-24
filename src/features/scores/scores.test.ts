@@ -58,6 +58,15 @@ describe("scoreInputSchema (unit)", () => {
     expect(scoreInputSchema.safeParse({ playerId: "p1", points: INT32_MIN - 1 }).success).toBe(false);
   });
 
+  it("rejects unknown fields (strict)", () => {
+    expect(
+      scoreInputSchema.safeParse({ playerId: "p1", points: 1, admin: true }).success,
+    ).toBe(false);
+    expect(scoreInputSchema.safeParse({ playerId: "p1", points: 1, extra: "x" }).success).toBe(
+      false,
+    );
+  });
+
   it("rejects wrong types", () => {
     expect(scoreInputSchema.safeParse({ playerId: 1, points: 1 }).success).toBe(false);
     expect(scoreInputSchema.safeParse({ playerId: "p1", points: "5" }).success).toBe(false);
@@ -153,6 +162,41 @@ describe("POST /scores (HTTP, against InMemoryStore)", () => {
       const res = await post(port, "{ not json");
       expect(res.status).toBe(400);
       expect(res.json.error).toBe("invalid_json");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 400 for a body with unknown/extra keys", async () => {
+    const store = new InMemoryStore();
+    const player = await store.addPlayer("alice");
+    const { app, port } = await boot(store);
+    try {
+      const res = await post(
+        port,
+        JSON.stringify({ playerId: player.id, points: 1, admin: true }),
+      );
+      expect(res.status).toBe(400);
+      expect(res.json.error).toBeDefined();
+      // The unknown-field body must NOT have persisted.
+      expect(await store.topScores()).toEqual([]);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 400 (a real response, not a reset) for an oversized body", async () => {
+    const store = new InMemoryStore();
+    const player = await store.addPlayer("alice");
+    const { app, port } = await boot(store);
+    try {
+      // > MAX_BODY_BYTES (1_000_000) of valid JSON: a real key padded huge.
+      const huge = JSON.stringify({ playerId: player.id, points: 1, pad: "x".repeat(1_100_000) });
+      const res = await post(port, huge);
+      expect(res.status).toBe(400);
+      expect(res.json.error).toBe("body_too_large");
+      // Nothing persisted.
+      expect(await store.topScores()).toEqual([]);
     } finally {
       app.close();
     }
