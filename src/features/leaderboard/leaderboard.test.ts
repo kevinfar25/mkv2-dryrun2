@@ -244,4 +244,22 @@ describe("GET /leaderboard (HTTP)", () => {
       app.close();
     }
   });
+
+  it("returns 404 for an authority-relative //host target (single-slash guard)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // An authority-relative target `//evil.com/leaderboard` also starts with
+      // "/", so a plain `startsWith("/")` guard lets it through. But
+      // `new URL("//evil.com/leaderboard", "http://localhost")` parses it with
+      // host=evil.com and pathname "/leaderboard" — wrongly matching the route
+      // with a spurious 200. The single-slash guard (`/^\/(?!\/)/`) rejects any
+      // "//..." target, leaving url=null so it falls through to 404
+      // (path-confusion defense).
+      const raw = await rawRequest(port, "GET //evil.com/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
 });

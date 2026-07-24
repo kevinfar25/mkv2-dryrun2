@@ -21,14 +21,16 @@ export function createApp(store: Store) {
       }
       // GET /leaderboard?limit= — top scores, ranked. Parse against a dummy
       // base so a relative req.url yields a URL we can read query params from.
-      // Only origin-form targets (starting with "/") are normalized: a
-      // slash-less target like `GET leaderboard HTTP/1.1` does NOT throw on
-      // parse — it normalizes to pathname "/leaderboard" and would wrongly
-      // match. Guarding on the leading slash makes /leaderboard consistent
-      // with /health's exact match, so a slash-less or missing target leaves
-      // url=null and falls through to 404 rather than a spurious 200.
+      // Only single-slash origin-form targets are eligible: req.url must start
+      // with exactly ONE "/" (not "//"). An authority-relative target like
+      // `//evil.com/leaderboard` also starts with "/", but parses with
+      // host=evil.com and pathname="/leaderboard" — it would wrongly match the
+      // route. Absolute-form (`http://localhost/leaderboard`, no leading
+      // slash) and slash-less/missing targets are likewise rejected. All of
+      // these leave url=null and fall through to 404 (path-confusion defense),
+      // keeping /leaderboard consistent with /health's exact match.
       let url: URL | null = null;
-      if (req.url && req.url.startsWith("/")) {
+      if (req.url && /^\/(?!\/)/.test(req.url)) {
         try {
           url = new URL(req.url, "http://localhost");
         } catch {
