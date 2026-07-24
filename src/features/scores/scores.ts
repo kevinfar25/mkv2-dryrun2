@@ -1,0 +1,18 @@
+import { z } from "zod";
+import { INT32_MIN, INT32_MAX } from "../../db/store.js";
+
+// Validation for POST /scores request bodies. Mirrors the store's `addScore`
+// contract so the HTTP layer rejects bad input BEFORE hitting persistence:
+//   - playerId: a non-empty string (uuids from PgStore are strings; the
+//     in-memory store uses `p1`-style ids — both are non-empty strings, so we
+//     require a non-empty string rather than a strict uuid to keep the two
+//     stores interchangeable).
+//   - points: an integer within the store's accepted int32 range
+//     [INT32_MIN, INT32_MAX] — identical bound to assertValidPoints, so a body
+//     that passes this schema will never trip the store's own guard.
+export const scoreInputSchema = z.object({
+  playerId: z.string().trim().min(1),
+  points: z.number().int().min(INT32_MIN).max(INT32_MAX),
+});
+
+export type ScoreInput = z.infer<typeof scoreInputSchema>;
