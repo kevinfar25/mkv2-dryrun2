@@ -262,4 +262,48 @@ describe("GET /leaderboard (HTTP)", () => {
       app.close();
     }
   });
+
+  it("returns 404 for a dot-segment alias (raw path, no normalization)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `new URL("/x/../leaderboard", base)` NORMALIZES dot-segments to pathname
+      // "/leaderboard" — an alias that would wrongly serve 200 under a normalized
+      // match. The exact raw-path match compares the literal target path
+      // "/x/../leaderboard" (never normalized) against "/leaderboard", so it
+      // falls through to 404 (closes the path-confusion class).
+      const raw = await rawRequest(port, "GET /x/../leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 for a percent-encoded dot-segment alias (raw path, no decode)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `new URL("/%2e%2e/leaderboard", base)` percent-decodes and normalizes to
+      // pathname "/leaderboard" — another path-confusion alias. The raw-path match
+      // keeps the target literal ("/%2e%2e/leaderboard"), never decoding it, so it
+      // does not equal "/leaderboard" and falls through to 404.
+      const raw = await rawRequest(port, "GET /%2e%2e/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("still serves the happy path ?limit= over a raw socket with the clamp applied", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3, 4, 5]));
+    try {
+      const raw = await rawRequest(port, "GET /leaderboard?limit=2 HTTP/1.1");
+      expect(raw.status).toBe(200);
+      const body = JSON.parse(raw.body) as Body;
+      expect(body.limit).toBe(2);
+      expect(body.scores.map((s) => s.points)).toEqual([5, 4]);
+    } finally {
+      app.close();
+    }
+  });
 });

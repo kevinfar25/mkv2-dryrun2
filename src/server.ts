@@ -19,26 +19,19 @@ export function createApp(store: Store) {
         json(res, ok ? 200 : 503, { status: ok ? "ok" : "degraded" });
         return;
       }
-      // GET /leaderboard?limit= — top scores, ranked. Parse against a dummy
-      // base so a relative req.url yields a URL we can read query params from.
-      // Only single-slash origin-form targets are eligible: req.url must start
-      // with exactly ONE "/" (not "//"). An authority-relative target like
-      // `//evil.com/leaderboard` also starts with "/", but parses with
-      // host=evil.com and pathname="/leaderboard" — it would wrongly match the
-      // route. Absolute-form (`http://localhost/leaderboard`, no leading
-      // slash) and slash-less/missing targets are likewise rejected. All of
-      // these leave url=null and fall through to 404 (path-confusion defense),
-      // keeping /leaderboard consistent with /health's exact match.
-      let url: URL | null = null;
-      if (req.url && /^\/(?!\/)/.test(req.url)) {
-        try {
-          url = new URL(req.url, "http://localhost");
-        } catch {
-          url = null;
-        }
-      }
-      if (req.method === "GET" && url?.pathname === "/leaderboard") {
-        const limit = clampLimit(url.searchParams.get("limit"));
+      // GET /leaderboard?limit= — top scores, ranked.
+      // Exact raw-path match: split the origin-form target on "?" and require the
+      // path part to be EXACTLY "/leaderboard" — no URL normalization, so
+      // dot-segment (/x/../leaderboard), percent-encoded (/%2e%2e/leaderboard),
+      // //authority, and absolute-form aliases all fall through to 404. Only the
+      // query string is then parsed (for ?limit=). Consistent with /health's exact match.
+      const rawTarget = req.url ?? "";
+      const qIdx = rawTarget.indexOf("?");
+      const rawPath = qIdx === -1 ? rawTarget : rawTarget.slice(0, qIdx);
+      if (req.method === "GET" && rawPath === "/leaderboard") {
+        const query = qIdx === -1 ? "" : rawTarget.slice(qIdx + 1);
+        const params = new URLSearchParams(query);
+        const limit = clampLimit(params.get("limit"));
         const body = await getLeaderboard(store, limit);
         json(res, 200, body);
         return;
