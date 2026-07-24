@@ -47,6 +47,20 @@ describe("computeStats (unit)", () => {
     expect(computeStats([-5, -1, -3])).toEqual({ best: -1, count: 3, average: -3 });
   });
 
+  it("rounds with integer arithmetic, not float (199×1 + 2 -> 1.01)", () => {
+    // sum = 201, count = 200, mean = 1.005 -> 1.01 (half away from zero).
+    // The float form Math.round((201/200)*100)/100 wrongly yields 1.
+    const points = [...Array(199).fill(1), 2];
+    expect(computeStats(points).average).toBe(1.01);
+  });
+
+  it("rounds negatives symmetrically (199×-1 + -2 -> -1.01)", () => {
+    // sum = -201, count = 200, mean = -1.005 -> -1.01. Math.round would bias
+    // toward +Infinity and give -1.00 here.
+    const points = [...Array(199).fill(-1), -2];
+    expect(computeStats(points).average).toBe(-1.01);
+  });
+
   it("returns nulls for the empty case", () => {
     expect(computeStats([])).toEqual({ best: null, count: 0, average: null });
   });

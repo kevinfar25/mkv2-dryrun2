@@ -162,6 +162,13 @@ export class InMemoryStore implements Store {
   private seq = 0;
   private seasonSeq = 0;
   private scoreSeq = 0;
+  // Monotonic INSERTION SEQUENCE per score id. `scoreSeq` (and thus the numeric
+  // suffix of the `s<n>` id) already increases per addScore, but the id is a
+  // STRING: lexicographic ordering breaks past 9 scores ("s10" < "s2"), which is
+  // exactly what corrupts a most-recent-first ordering keyed off id text. This
+  // map preserves the true numeric insertion order so scoresForPlayer can order
+  // by it directly instead of by the string id.
+  private insertionSeq = new Map<string, number>();
 
   // All in-memory scores share one created_at VALUE. Postgres `now()` is the
   // transaction timestamp, so scores inserted in the same instant/transaction
@@ -240,6 +247,8 @@ export class InMemoryStore implements Store {
       // would even when the caller passed uppercase).
       seasonId: normalizedSeason,
     };
+    // Record the numeric insertion order for this id (see insertionSeq).
+    this.insertionSeq.set(score.id, n);
     // Store an immutable snapshot; return an independent clone so a caller
     // mutating either the returned object or its Date can't corrupt store state.
     this.scores.push(clone(score));
@@ -279,10 +288,18 @@ export class InMemoryStore implements Store {
     return rows.map((s) => ({ ...clone(s), seasonId: outSeason }));
   }
 
-  // A player's points, most-recent-first: created_at DESC, then id DESC as the
-  // deterministic tie-break (identical string/text ordering to PgStore). All
-  // in-memory scores share CLOCK_MS, so the id DESC tie-break carries the
-  // ordering — exactly the parity edge topScores exercises, mirrored here.
+  // A player's points, most-recent-first: created_at DESC, then INSERTION
+  // SEQUENCE DESC (see insertionSeq). All in-memory scores share CLOCK_MS, so
+  // the sequence tie-break carries the ordering; using the numeric insertion
+  // sequence (not the string id) makes this genuinely most-recent-first even
+  // past 10 scores, where lexicographic id ordering ("s10" < "s2") would fail.
+  //
+  // Cross-store note: PgStore tie-breaks identical created_at by `id DESC`
+  // (uuid text), a different domain from this insertion sequence, so on rows
+  // that collide on created_at the two stores' relative order is inherently
+  // arbitrary (a documented limitation). What must hold in BOTH stores is that
+  // WITHIN a store the ordering is correct most-recent-first / deterministic.
+  //
   // Unknown player -> [] (a player with no scores also yields []).
   async scoresForPlayer(playerId: string): Promise<number[]> {
     return this.scores
@@ -290,7 +307,7 @@ export class InMemoryStore implements Store {
       .sort(
         (a, b) =>
           b.createdAt.getTime() - a.createdAt.getTime() ||
-          (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+          (this.insertionSeq.get(b.id) ?? 0) - (this.insertionSeq.get(a.id) ?? 0),
       )
       .map((s) => s.points);
   }
@@ -453,8 +470,11 @@ export class PgStore implements Store {
     }));
   }
 
-  // A player's points, most-recent-first. Deterministic, identical to
-  // InMemoryStore: created_at DESC, then id DESC. Pure read of scores.points;
+  // A player's points, most-recent-first: created_at DESC, then id DESC (uuid
+  // text) as a deterministic tie-break. On rows with identical created_at the
+  // cross-store order vs InMemoryStore (which tie-breaks on insertion sequence)
+  // is inherently arbitrary — a documented limitation; WITHIN this store the
+  // ordering is deterministic and most-recent-first. Pure read of scores.points;
   // references no other/new columns (expand/contract safe). An unknown player
   // simply matches no rows and returns [] — same as a player with no scores.
   async scoresForPlayer(playerId: string): Promise<number[]> {
