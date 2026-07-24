@@ -52,18 +52,18 @@ describe("InMemoryStore scores", () => {
     // the result would stay reversed. Only `id ASC` reorders it to s1,s2,s3.
     const t = new Date(0);
     const rows: Score[] = [
-      { id: "s3", playerId: "p3", points: 50, createdAt: t },
-      { id: "s2", playerId: "p2", points: 50, createdAt: t },
-      { id: "s1", playerId: "p1", points: 50, createdAt: t },
+      { id: "s3", playerId: "p3", points: 50, createdAt: t, seasonId: null },
+      { id: "s2", playerId: "p2", points: 50, createdAt: t, seasonId: null },
+      { id: "s1", playerId: "p1", points: 50, createdAt: t, seasonId: null },
     ];
     const sorted = [...rows].sort(compareScores);
     expect(sorted.map((s) => s.id)).toEqual(["s1", "s2", "s3"]);
 
     // And that id tie-break only applies AFTER points DESC and created_at ASC:
     const mixed: Score[] = [
-      { id: "s1", playerId: "p1", points: 10, createdAt: new Date(1000) },
-      { id: "s2", playerId: "p2", points: 20, createdAt: new Date(5000) },
-      { id: "s3", playerId: "p3", points: 20, createdAt: new Date(2000) },
+      { id: "s1", playerId: "p1", points: 10, createdAt: new Date(1000), seasonId: null },
+      { id: "s2", playerId: "p2", points: 20, createdAt: new Date(5000), seasonId: null },
+      { id: "s3", playerId: "p3", points: 20, createdAt: new Date(2000), seasonId: null },
     ];
     // points DESC -> the two 20s first; among them created_at ASC -> s3 (2000)
     // before s2 (5000); the lone 10 last.
@@ -197,6 +197,59 @@ describe("InMemoryStore scores", () => {
     await expect(
       store.addScore(a, Number.MAX_SAFE_INTEGER + 1),
     ).rejects.toThrow(/invalid points/);
+  });
+
+  it("filters topScores by season when a seasonId is passed", async () => {
+    const store = new InMemoryStore();
+    const [a, b, c] = await makePlayers(store, 3);
+    const s1 = "11111111-1111-1111-1111-111111111111";
+    const s2 = "22222222-2222-2222-2222-222222222222";
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 30, s2);
+    await store.addScore(c, 20, s1);
+
+    // Filtered to s1: only the two s1 scores, still fully ordered.
+    const inS1 = await store.topScores(10, s1);
+    expect(inS1.map((x) => x.points)).toEqual([20, 10]);
+    expect(inS1.map((x) => x.playerId)).toEqual([c, a]);
+    expect(inS1.every((x) => x.seasonId === s1)).toBe(true);
+
+    // Filtered to s2: only the single s2 score.
+    const inS2 = await store.topScores(10, s2);
+    expect(inS2.map((x) => x.points)).toEqual([30]);
+    expect(inS2[0].playerId).toBe(b);
+  });
+
+  it("default path (no seasonId) keeps current behavior across seasons", async () => {
+    const store = new InMemoryStore();
+    const [a, b, c] = await makePlayers(store, 3);
+    const s1 = "11111111-1111-1111-1111-111111111111";
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 30); // no season
+    await store.addScore(c, 20, s1);
+
+    // Omitting seasonId returns ALL scores regardless of season, ordered as before.
+    const all = await store.topScores(10);
+    expect(all.map((x) => x.points)).toEqual([30, 20, 10]);
+    expect(all.map((x) => x.playerId)).toEqual([b, c, a]);
+    // The default path never surfaces season_id (parity with PgStore, which
+    // can't project it without breaking expand/contract).
+    expect(all.every((x) => x.seasonId === null)).toBe(true);
+  });
+
+  it("returns an empty array for a seasonId with no matching scores", async () => {
+    const store = new InMemoryStore();
+    const [a, b] = await makePlayers(store, 2);
+    const s1 = "11111111-1111-1111-1111-111111111111";
+    await store.addScore(a, 10, s1);
+    await store.addScore(b, 20, s1);
+
+    const none = await store.topScores(10, "99999999-9999-9999-9999-999999999999");
+    expect(none).toEqual([]);
+
+    // Passing null filters to the not-yet-attached (season-less) scores, of which
+    // there are none here.
+    expect(await store.topScores(10, null)).toEqual([]);
   });
 
   it("does not mutate internal state when sorting", async () => {

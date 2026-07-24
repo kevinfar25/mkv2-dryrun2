@@ -6,6 +6,10 @@ export type Score = {
   playerId: string;
   points: number;
   createdAt: Date;
+  // Nullable season tag (P4). `null` = not attached to any season. Only
+  // referenced when a caller opts into season-scoped writes/reads; the default
+  // paths ignore it entirely so old code + pre-migration schema keep working.
+  seasonId: string | null;
 };
 
 /**
@@ -16,8 +20,12 @@ export type Score = {
 export interface Store {
   addPlayer(name: string): Promise<Player>;
   getPlayer(id: string): Promise<Player | null>;
-  addScore(playerId: string, points: number): Promise<Score>;
-  topScores(limit?: number | null): Promise<Score[]>;
+  addScore(playerId: string, points: number, seasonId?: string | null): Promise<Score>;
+  // topScores filters by season ONLY when seasonId is passed. Omitting it (the
+  // default path) must not touch the season_id column at all, so pre-migration
+  // schema + old code stay correct (expand/contract — migrations deploy
+  // separately from code).
+  topScores(limit?: number | null, seasonId?: string | null): Promise<Score[]>;
   health(): Promise<boolean>;
 }
 
@@ -109,7 +117,11 @@ export class InMemoryStore implements Store {
     return this.players.get(id) ?? null;
   }
 
-  async addScore(playerId: string, points: number): Promise<Score> {
+  async addScore(
+    playerId: string,
+    points: number,
+    seasonId: string | null = null,
+  ): Promise<Score> {
     assertValidPoints(points);
     // Enforce the same FK contract PgStore gets for free from
     // scores.player_id -> players.id: unknown players are rejected.
@@ -122,6 +134,7 @@ export class InMemoryStore implements Store {
       playerId,
       points,
       createdAt: new Date(InMemoryStore.CLOCK_MS),
+      seasonId,
     };
     // Store an immutable snapshot; return an independent clone so a caller
     // mutating either the returned object or its Date can't corrupt store state.
@@ -129,11 +142,25 @@ export class InMemoryStore implements Store {
     return clone(score);
   }
 
-  async topScores(limit?: number | null): Promise<Score[]> {
+  async topScores(
+    limit?: number | null,
+    seasonId?: string | null,
+  ): Promise<Score[]> {
     const n = normalizeLimit(limit);
-    const sorted = [...this.scores].sort(compareScores);
+    // Season filter is opt-in: only when a seasonId is explicitly passed do we
+    // touch season_id at all. The default path is byte-for-byte the old
+    // behavior (mirrors PgStore, whose default query never names season_id).
+    const source =
+      seasonId === undefined
+        ? this.scores
+        : this.scores.filter((s) => s.seasonId === seasonId);
+    const sorted = [...source].sort(compareScores);
     const rows = n === null ? sorted : sorted.slice(0, n);
-    return rows.map(clone);
+    // Match PgStore's projection exactly: the default path never surfaces
+    // season_id (Pg can't select it without breaking expand/contract), so it
+    // reports null; the filtered path reports the season it filtered on.
+    const outSeason = seasonId ?? null;
+    return rows.map((s) => ({ ...clone(s), seasonId: outSeason }));
   }
 
   async health(): Promise<boolean> {
@@ -164,21 +191,37 @@ export class PgStore implements Store {
     return rows[0] ?? null;
   }
 
-  async addScore(playerId: string, points: number): Promise<Score> {
+  async addScore(
+    playerId: string,
+    points: number,
+    seasonId: string | null = null,
+  ): Promise<Score> {
     // Same points contract as InMemoryStore.
     assertValidPoints(points);
     try {
+      // Expand/contract: the DEFAULT path never names season_id, so this store
+      // still writes cleanly against the pre-migration schema. Only a caller
+      // that explicitly attaches a season opts into the season_id column.
+      const withSeason = seasonId != null;
+      const sql = withSeason
+        ? "INSERT INTO scores(player_id, points, season_id) VALUES($1, $2, $3) RETURNING id, player_id, points, created_at, season_id"
+        : "INSERT INTO scores(player_id, points) VALUES($1, $2) RETURNING id, player_id, points, created_at";
+      const params = withSeason ? [playerId, points, seasonId] : [playerId, points];
       const { rows } = await this.pool.query<{
         id: string;
         player_id: string;
         points: number;
         created_at: Date;
-      }>(
-        "INSERT INTO scores(player_id, points) VALUES($1, $2) RETURNING id, player_id, points, created_at",
-        [playerId, points],
-      );
+        season_id?: string | null;
+      }>(sql, params);
       const r = rows[0];
-      return { id: r.id, playerId: r.player_id, points: r.points, createdAt: r.created_at };
+      return {
+        id: r.id,
+        playerId: r.player_id,
+        points: r.points,
+        createdAt: r.created_at,
+        seasonId: r.season_id ?? null,
+      };
     } catch (err) {
       // Normalize the unknown-player rejection to the SAME domain error
       // InMemoryStore throws. Postgres surfaces a missing FK as 23503
@@ -192,25 +235,41 @@ export class PgStore implements Store {
     }
   }
 
-  async topScores(limit?: number | null): Promise<Score[]> {
+  async topScores(
+    limit?: number | null,
+    seasonId?: string | null,
+  ): Promise<Score[]> {
+    // Expand/contract (critical): the DEFAULT query never references season_id,
+    // so it runs unchanged against the pre-migration schema. A WHERE season_id
+    // clause is added ONLY when a caller explicitly passes a seasonId; the
+    // selected columns stay identical either way.
+    const filtered = seasonId !== undefined;
+    const where = filtered ? "WHERE season_id IS NOT DISTINCT FROM $2 " : "";
+    // Deterministic, identical to InMemoryStore: points desc, then created_at
+    // asc (earliest first), then id as the final stable tie-break.
+    // LIMIT NULL is unbounded in Postgres, matching normalizeLimit's "all
+    // rows" contract for non-finite / oversized input.
+    const sql =
+      `SELECT id, player_id, points, created_at FROM scores ${where}` +
+      "ORDER BY points DESC, created_at ASC, id ASC LIMIT $1";
+    const params = filtered
+      ? [normalizeLimit(limit), seasonId]
+      : [normalizeLimit(limit)];
     const { rows } = await this.pool.query<{
       id: string;
       player_id: string;
       points: number;
       created_at: Date;
-    }>(
-      // Deterministic, identical to InMemoryStore: points desc, then created_at
-      // asc (earliest first), then id as the final stable tie-break.
-      // LIMIT NULL is unbounded in Postgres, matching normalizeLimit's "all
-      // rows" contract for non-finite / oversized input.
-      "SELECT id, player_id, points, created_at FROM scores ORDER BY points DESC, created_at ASC, id ASC LIMIT $1",
-      [normalizeLimit(limit)],
-    );
+    }>(sql, params);
     return rows.map((r) => ({
       id: r.id,
       playerId: r.player_id,
       points: r.points,
       createdAt: r.created_at,
+      // The default projection doesn't select season_id; callers that need it
+      // pass a seasonId (and already know which season they filtered on). Keep
+      // the shape consistent with the Score type.
+      seasonId: seasonId ?? null,
     }));
   }
 
