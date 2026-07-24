@@ -1,0 +1,309 @@
+import { describe, it, expect } from "vitest";
+import { once } from "node:events";
+import net from "node:net";
+import type { AddressInfo } from "node:net";
+import { InMemoryStore } from "../../db/store.js";
+import { createApp } from "../../server.js";
+import {
+  clampLimit,
+  getLeaderboard,
+  LIMIT_DEFAULT,
+  LIMIT_MAX,
+} from "./leaderboard.js";
+
+// Seed a store with `points` values, one player per score so FK contract holds.
+// Returns the store. All scores share created_at (InMemoryStore CLOCK_MS), so
+// equal-points rows fall through to the id (insertion-order) tie-break.
+async function seed(points: number[]): Promise<InMemoryStore> {
+  const store = new InMemoryStore();
+  for (const p of points) {
+    const player = await store.addPlayer(`player-${p}`);
+    await store.addScore(player.id, p);
+  }
+  return store;
+}
+
+async function boot(store: InMemoryStore) {
+  const app = createApp(store);
+  app.listen(0);
+  await once(app, "listening");
+  const { port } = app.address() as AddressInfo;
+  return { app, port };
+}
+
+// Send a raw HTTP/1.1 request line over a socket so we can emit request targets
+// that `fetch`/`URL` would refuse to construct. Returns the parsed status code
+// and response body. Only used to exercise the malformed-target guard.
+function rawRequest(
+  port: number,
+  requestLine: string,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(port, "127.0.0.1", () => {
+      sock.write(`${requestLine}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+    const chunks: Buffer[] = [];
+    sock.on("data", (c) => chunks.push(c));
+    sock.on("error", reject);
+    sock.on("close", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      const match = /^HTTP\/1\.\d (\d{3})/.exec(text);
+      if (!match) {
+        reject(new Error(`no status line in response: ${JSON.stringify(text)}`));
+        return;
+      }
+      // The response is chunk-encoded (no content-length); pull the JSON object
+      // out of the body region rather than decoding chunk framing by hand.
+      const sep = text.indexOf("\r\n\r\n");
+      const rest = sep === -1 ? "" : text.slice(sep + 4);
+      const open = rest.indexOf("{");
+      const close = rest.lastIndexOf("}");
+      const body = open === -1 || close === -1 ? "" : rest.slice(open, close + 1);
+      resolve({ status: Number(match[1]), body });
+    });
+  });
+}
+
+type Body = {
+  limit: number;
+  scores: { id: string; playerId: string; points: number; createdAt: string }[];
+};
+
+describe("clampLimit", () => {
+  it("defaults when absent/empty/unparseable", () => {
+    expect(clampLimit(null)).toBe(LIMIT_DEFAULT);
+    expect(clampLimit(undefined)).toBe(LIMIT_DEFAULT);
+    expect(clampLimit("")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit("abc")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit("NaN")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit(" ")).toBe(LIMIT_DEFAULT);
+    expect(clampLimit("   ")).toBe(LIMIT_DEFAULT);
+  });
+
+  it("trims surrounding whitespace before parsing", () => {
+    expect(clampLimit(" 5 ")).toBe(5);
+  });
+
+  it("clamps zero and negatives up to 1", () => {
+    expect(clampLimit("0")).toBe(1);
+    expect(clampLimit("-5")).toBe(1);
+    expect(clampLimit("-1e9")).toBe(1);
+  });
+
+  it("caps huge values at LIMIT_MAX", () => {
+    expect(clampLimit("1000")).toBe(LIMIT_MAX);
+    expect(clampLimit("1e100")).toBe(LIMIT_MAX);
+    expect(clampLimit(String(Number.MAX_SAFE_INTEGER))).toBe(LIMIT_MAX);
+  });
+
+  it("truncates floats and preserves in-range integers", () => {
+    expect(clampLimit("5")).toBe(5);
+    expect(clampLimit("5.9")).toBe(5);
+    expect(clampLimit("100")).toBe(100);
+  });
+});
+
+describe("getLeaderboard (unit, against InMemoryStore)", () => {
+  it("orders by points desc", async () => {
+    const store = await seed([10, 30, 20]);
+    const { scores } = await getLeaderboard(store, 10);
+    expect(scores.map((s) => s.points)).toEqual([30, 20, 10]);
+  });
+
+  it("tie-breaks equal points by created_at then id (insertion order)", async () => {
+    const store = await seed([50, 50, 50]);
+    const { scores } = await getLeaderboard(store, 10);
+    // All equal points + equal created_at -> stable id order s1,s2,s3.
+    expect(scores.map((s) => s.id)).toEqual(["s1", "s2", "s3"]);
+  });
+
+  it("honors the limit", async () => {
+    const store = await seed([1, 2, 3, 4, 5]);
+    const { scores, limit } = await getLeaderboard(store, 2);
+    expect(limit).toBe(2);
+    expect(scores.map((s) => s.points)).toEqual([5, 4]);
+  });
+
+  it("serializes createdAt as an ISO string", async () => {
+    const store = await seed([7]);
+    const { scores } = await getLeaderboard(store, 10);
+    expect(typeof scores[0].createdAt).toBe("string");
+    expect(() => new Date(scores[0].createdAt).toISOString()).not.toThrow();
+  });
+});
+
+describe("GET /leaderboard (HTTP)", () => {
+  it("returns ranked scores", async () => {
+    const { app, port } = await boot(await seed([10, 30, 20]));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/leaderboard`);
+      const body = (await res.json()) as Body;
+      expect(res.status).toBe(200);
+      expect(body.scores.map((s) => s.points)).toEqual([30, 20, 10]);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("honors ?limit=", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3, 4, 5]));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/leaderboard?limit=2`);
+      const body = (await res.json()) as Body;
+      expect(body.limit).toBe(2);
+      expect(body.scores.map((s) => s.points)).toEqual([5, 4]);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("clamps a huge ?limit= to LIMIT_MAX", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/leaderboard?limit=999999`);
+      const body = (await res.json()) as Body;
+      expect(body.limit).toBe(LIMIT_MAX);
+      // Only 3 rows exist, all returned, ranked.
+      expect(body.scores.map((s) => s.points)).toEqual([3, 2, 1]);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("clamps zero/negative ?limit= up to 1", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      for (const q of ["limit=0", "limit=-4"]) {
+        const res = await fetch(`http://127.0.0.1:${port}/leaderboard?${q}`);
+        const body = (await res.json()) as Body;
+        expect(body.limit).toBe(1);
+        expect(body.scores.map((s) => s.points)).toEqual([3]);
+      }
+    } finally {
+      app.close();
+    }
+  });
+
+  it("defaults when ?limit= is absent", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/leaderboard`);
+      const body = (await res.json()) as Body;
+      expect(body.limit).toBe(LIMIT_DEFAULT);
+    } finally {
+      app.close();
+    }
+  });
+
+  it("defaults for whitespace-only or non-numeric ?limit=", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      for (const q of ["limit=%20", "limit=abc"]) {
+        const res = await fetch(`http://127.0.0.1:${port}/leaderboard?${q}`);
+        const body = (await res.json()) as Body;
+        expect(body.limit).toBe(LIMIT_DEFAULT);
+      }
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 (not 500) for a malformed request target", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `fetch` can't emit a request target that `new URL()` rejects, so drive
+      // a raw socket with a request line whose target genuinely throws in the
+      // server's `new URL(req.url, base)` guard: `req.url` becomes "///%", and
+      // `new URL("///%", "http://localhost")` throws (verified). This proves the
+      // guard treats an unparseable target as a non-match -> 404, NOT a 500 that
+      // escapes to the internal-error catch. Removing the guard makes this 500.
+      const raw = await rawRequest(port, "GET ///% HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 for a slash-less request target (origin-form guard)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `fetch` always sends an origin-form target ("/leaderboard"). Node's own
+      // parser 400s a bare `GET leaderboard HTTP/1.1` before the handler, so
+      // drive an absolute-form target instead — valid HTTP/1.1 (proxy form)
+      // that Node accepts and delivers verbatim as `req.url =
+      // "http://localhost/leaderboard"`, which does NOT start with "/". Without
+      // the leading-slash guard, `new URL(req.url, base)` normalizes it to
+      // pathname "/leaderboard" and wrongly matches with a spurious 200. The
+      // guard leaves url=null so it falls through to 404 — consistent with
+      // /health's exact-match rejection of non-origin-form targets.
+      const raw = await rawRequest(port, "GET http://localhost/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 for an authority-relative //host target (single-slash guard)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // An authority-relative target `//evil.com/leaderboard` also starts with
+      // "/", so a plain `startsWith("/")` guard lets it through. But
+      // `new URL("//evil.com/leaderboard", "http://localhost")` parses it with
+      // host=evil.com and pathname "/leaderboard" — wrongly matching the route
+      // with a spurious 200. The single-slash guard (`/^\/(?!\/)/`) rejects any
+      // "//..." target, leaving url=null so it falls through to 404
+      // (path-confusion defense).
+      const raw = await rawRequest(port, "GET //evil.com/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 for a dot-segment alias (raw path, no normalization)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `new URL("/x/../leaderboard", base)` NORMALIZES dot-segments to pathname
+      // "/leaderboard" — an alias that would wrongly serve 200 under a normalized
+      // match. The exact raw-path match compares the literal target path
+      // "/x/../leaderboard" (never normalized) against "/leaderboard", so it
+      // falls through to 404 (closes the path-confusion class).
+      const raw = await rawRequest(port, "GET /x/../leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("returns 404 for a percent-encoded dot-segment alias (raw path, no decode)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `new URL("/%2e%2e/leaderboard", base)` percent-decodes and normalizes to
+      // pathname "/leaderboard" — another path-confusion alias. The raw-path match
+      // keeps the target literal ("/%2e%2e/leaderboard"), never decoding it, so it
+      // does not equal "/leaderboard" and falls through to 404.
+      const raw = await rawRequest(port, "GET /%2e%2e/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
+
+  it("still serves the happy path ?limit= over a raw socket with the clamp applied", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3, 4, 5]));
+    try {
+      const raw = await rawRequest(port, "GET /leaderboard?limit=2 HTTP/1.1");
+      expect(raw.status).toBe(200);
+      const body = JSON.parse(raw.body) as Body;
+      expect(body.limit).toBe(2);
+      expect(body.scores.map((s) => s.points)).toEqual([5, 4]);
+    } finally {
+      app.close();
+    }
+  });
+});
