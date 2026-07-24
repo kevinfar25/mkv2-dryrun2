@@ -224,4 +224,24 @@ describe("GET /leaderboard (HTTP)", () => {
       app.close();
     }
   });
+
+  it("returns 404 for a slash-less request target (origin-form guard)", async () => {
+    const { app, port } = await boot(await seed([1, 2, 3]));
+    try {
+      // `fetch` always sends an origin-form target ("/leaderboard"). Node's own
+      // parser 400s a bare `GET leaderboard HTTP/1.1` before the handler, so
+      // drive an absolute-form target instead — valid HTTP/1.1 (proxy form)
+      // that Node accepts and delivers verbatim as `req.url =
+      // "http://localhost/leaderboard"`, which does NOT start with "/". Without
+      // the leading-slash guard, `new URL(req.url, base)` normalizes it to
+      // pathname "/leaderboard" and wrongly matches with a spurious 200. The
+      // guard leaves url=null so it falls through to 404 — consistent with
+      // /health's exact-match rejection of non-origin-form targets.
+      const raw = await rawRequest(port, "GET http://localhost/leaderboard HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
+    } finally {
+      app.close();
+    }
+  });
 });

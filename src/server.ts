@@ -21,13 +21,19 @@ export function createApp(store: Store) {
       }
       // GET /leaderboard?limit= — top scores, ranked. Parse against a dummy
       // base so a relative req.url yields a URL we can read query params from.
-      // A malformed request target throws on parse; treat that as a non-match
-      // so it falls through to 404 rather than escaping to the 500 catch.
+      // Only origin-form targets (starting with "/") are normalized: a
+      // slash-less target like `GET leaderboard HTTP/1.1` does NOT throw on
+      // parse — it normalizes to pathname "/leaderboard" and would wrongly
+      // match. Guarding on the leading slash makes /leaderboard consistent
+      // with /health's exact match, so a slash-less or missing target leaves
+      // url=null and falls through to 404 rather than a spurious 200.
       let url: URL | null = null;
-      try {
-        url = new URL(req.url ?? "/", "http://localhost");
-      } catch {
-        url = null;
+      if (req.url && req.url.startsWith("/")) {
+        try {
+          url = new URL(req.url, "http://localhost");
+        } catch {
+          url = null;
+        }
       }
       if (req.method === "GET" && url?.pathname === "/leaderboard") {
         const limit = clampLimit(url.searchParams.get("limit"));
