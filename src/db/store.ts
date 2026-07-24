@@ -22,6 +22,11 @@ export interface Store {
   health(): Promise<boolean>;
 }
 
+/** Clamp a caller-supplied limit identically in both stores: integer, never < 0. */
+function clampLimit(limit: number): number {
+  return Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 0;
+}
+
 export class InMemoryStore implements Store {
   private players = new Map<string, Player>();
   private scores: Score[] = [];
@@ -40,15 +45,16 @@ export class InMemoryStore implements Store {
   }
 
   async addScore(playerId: string, points: number): Promise<Score> {
+    // Mirror the scores.player_id -> players.id FK: reject unknown players.
+    if (!this.players.has(playerId)) {
+      throw new Error(`unknown player_id: ${playerId}`);
+    }
     const n = ++this.scoreSeq;
-    // Strictly increasing createdAt so insertion order == created_at order,
-    // keeping the points-DESC / created_at-ASC tie-break deterministic (mirrors
-    // sequential now() defaults in PgStore).
     const score: Score = {
       id: `s${n}`,
       playerId,
       points,
-      createdAt: new Date(n),
+      createdAt: new Date(),
     };
     this.scores.push(score);
     return score;
@@ -59,9 +65,10 @@ export class InMemoryStore implements Store {
       .sort(
         (a, b) =>
           b.points - a.points ||
-          a.createdAt.getTime() - b.createdAt.getTime(),
+          a.createdAt.getTime() - b.createdAt.getTime() ||
+          (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
       )
-      .slice(0, limit);
+      .slice(0, clampLimit(limit));
   }
 
   async health(): Promise<boolean> {
@@ -106,9 +113,9 @@ export class PgStore implements Store {
     const { rows } = await this.pool.query(
       `SELECT id, player_id, points, created_at
        FROM scores
-       ORDER BY points DESC, created_at ASC
+       ORDER BY points DESC, created_at ASC, id ASC
        LIMIT $1`,
-      [limit],
+      [clampLimit(limit)],
     );
     return rows.map((r) => this.rowToScore(r));
   }
