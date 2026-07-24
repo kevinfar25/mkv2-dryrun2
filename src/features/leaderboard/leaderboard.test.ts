@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { once } from "node:events";
+import net from "node:net";
 import type { AddressInfo } from "node:net";
 import { InMemoryStore } from "../../db/store.js";
 import { createApp } from "../../server.js";
@@ -28,6 +29,39 @@ async function boot(store: InMemoryStore) {
   await once(app, "listening");
   const { port } = app.address() as AddressInfo;
   return { app, port };
+}
+
+// Send a raw HTTP/1.1 request line over a socket so we can emit request targets
+// that `fetch`/`URL` would refuse to construct. Returns the parsed status code
+// and response body. Only used to exercise the malformed-target guard.
+function rawRequest(
+  port: number,
+  requestLine: string,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(port, "127.0.0.1", () => {
+      sock.write(`${requestLine}\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+    });
+    const chunks: Buffer[] = [];
+    sock.on("data", (c) => chunks.push(c));
+    sock.on("error", reject);
+    sock.on("close", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      const match = /^HTTP\/1\.\d (\d{3})/.exec(text);
+      if (!match) {
+        reject(new Error(`no status line in response: ${JSON.stringify(text)}`));
+        return;
+      }
+      // The response is chunk-encoded (no content-length); pull the JSON object
+      // out of the body region rather than decoding chunk framing by hand.
+      const sep = text.indexOf("\r\n\r\n");
+      const rest = sep === -1 ? "" : text.slice(sep + 4);
+      const open = rest.indexOf("{");
+      const close = rest.lastIndexOf("}");
+      const body = open === -1 || close === -1 ? "" : rest.slice(open, close + 1);
+      resolve({ status: Number(match[1]), body });
+    });
+  });
 }
 
 type Body = {
@@ -177,11 +211,15 @@ describe("GET /leaderboard (HTTP)", () => {
   it("returns 404 (not 500) for a malformed request target", async () => {
     const { app, port } = await boot(await seed([1, 2, 3]));
     try {
-      // A raw malformed path that URL() can't parse against the dummy base.
-      const res = await fetch(`http://127.0.0.1:${port}/%`);
-      const body = (await res.json()) as { error?: string };
-      expect(res.status).toBe(404);
-      expect(body.error).toBe("not_found");
+      // `fetch` can't emit a request target that `new URL()` rejects, so drive
+      // a raw socket with a request line whose target genuinely throws in the
+      // server's `new URL(req.url, base)` guard: `req.url` becomes "///%", and
+      // `new URL("///%", "http://localhost")` throws (verified). This proves the
+      // guard treats an unparseable target as a non-match -> 404, NOT a 500 that
+      // escapes to the internal-error catch. Removing the guard makes this 500.
+      const raw = await rawRequest(port, "GET ///% HTTP/1.1");
+      expect(raw.status).toBe(404);
+      expect(JSON.parse(raw.body).error).toBe("not_found");
     } finally {
       app.close();
     }
